@@ -6,3 +6,16 @@ __pycache__/
 logs/*
 workspace/output/*
 workspace/scratch/*
+# Python packaging
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment / secrets
+.env
+.venv/
