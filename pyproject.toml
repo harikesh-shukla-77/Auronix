@@ -8,5 +8,10 @@ version = "0.1.0"
 description = "A controlled autonomous personal intelligence system"
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=9,<10",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
