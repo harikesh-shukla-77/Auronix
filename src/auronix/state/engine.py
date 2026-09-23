@@ -107,6 +107,7 @@ class StateEngine:
         current_status = state.task.status
 
         if new_status == current_status:
+            self.store.save(state)
             return state
 
         allowed = _ALLOWED_TRANSITIONS[current_status]
@@ -130,6 +131,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def attach_plan(self, task_id: str, plan: Plan) -> TaskState:
@@ -149,6 +151,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def set_current_step(
@@ -176,6 +179,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def record_action(self, action: Action) -> TaskState:
@@ -189,6 +193,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def record_observation(
@@ -220,6 +225,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def record_verification(
@@ -239,6 +245,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def record_critique(
@@ -255,6 +262,7 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state
 
     def set_result(
@@ -271,4 +279,5 @@ class StateEngine:
             )
         )
 
+        self.store.save(state)
         return state

@@ -19,3 +19,9 @@ __pycache__/
 # Environment / secrets
 .env
 .venv/
+
+# Runtime state databases
+*.db
+*.sqlite
+*.sqlite3
+workspace/state/*

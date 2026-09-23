@@ -67,6 +67,12 @@ class TaskStore:
     def all(self) -> list[TaskState]:
         return list(self._tasks.values())
 
+    def save(self, state: TaskState) -> None:
+        if state.task.task_id not in self._tasks:
+            raise KeyError(f"Task not found: {state.task.task_id}")
+
+        self._tasks[state.task.task_id] = state
+
     def delete(self, task_id: str) -> None:
         if task_id not in self._tasks:
             raise KeyError(f"Task not found: {task_id}")
