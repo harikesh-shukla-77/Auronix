@@ -6,6 +6,7 @@ from typing import Any
 @dataclass
 class Observation:
     observation_id: str
+    task_id: str
     action_id: str
     source: str
 

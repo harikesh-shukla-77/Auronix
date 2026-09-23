@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 @dataclass
 class Critique:
     critique_id: str
+    task_id: str
     target: str
 
     issues: list[str] = field(default_factory=list)

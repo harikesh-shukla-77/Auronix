@@ -78,6 +78,7 @@ def test_observation_model():
 
     observation = Observation(
         observation_id="OBS-001",
+        task_id="TASK-001",
         action_id="ACT-001",
         source="test-tool",
         raw_result="42",
@@ -115,6 +116,7 @@ def test_critique_model():
 
     critique = Critique(
         critique_id="CRIT-001",
+        task_id="TASK-001",
         target="test result",
         issues=["Possible missing evidence"],
         missing_evidence=["independent verification"],

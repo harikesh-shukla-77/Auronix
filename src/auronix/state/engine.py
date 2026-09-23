@@ -195,9 +195,19 @@ class StateEngine:
         self,
         observation: Observation,
     ) -> TaskState:
-        state = self.get_task(
-            self._task_id_from_action(observation.action_id)
+        state = self.get_task(observation.task_id)
+
+        action_exists = any(
+            action.action_id == observation.action_id
+            for action in state.actions
         )
+
+        if not action_exists:
+            raise ValueError(
+                f"Action {observation.action_id} does not belong "
+                f"to task {observation.task_id}"
+            )
+
         state.observations.append(observation)
 
         state.events.append(
@@ -231,10 +241,11 @@ class StateEngine:
 
         return state
 
-    def record_critique(self, critique: Critique) -> TaskState:
-        task_id = self._infer_task_id_from_target(critique.target)
-
-        state = self.get_task(task_id)
+    def record_critique(
+        self,
+        critique: Critique,
+    ) -> TaskState:
+        state = self.get_task(critique.task_id)
         state.critiques.append(critique)
 
         state.events.append(
@@ -261,23 +272,3 @@ class StateEngine:
         )
 
         return state
-
-    def _task_id_from_action(self, action_id: str) -> str:
-        for state in self.store.all():
-            if any(
-                action.action_id == action_id
-                for action in state.actions
-            ):
-                return state.task.task_id
-
-        raise KeyError(f"Action not found: {action_id}")
-
-    def _infer_task_id_from_target(self, target: str) -> str:
-        for state in self.store.all():
-            if state.task.task_id in target:
-                return state.task.task_id
-
-        raise KeyError(
-            "Could not associate critique with a task. "
-            "Include the task ID in the critique target."
-        )
