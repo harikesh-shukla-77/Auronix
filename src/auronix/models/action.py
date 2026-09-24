@@ -36,6 +36,7 @@ class Action:
     risk_level: str = "low"
     permission_required: bool = False
     status: ActionStatus = ActionStatus.PENDING
+    approval_id: str | None = None
 
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()

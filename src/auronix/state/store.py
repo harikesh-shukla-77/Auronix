@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from auronix.models.action import Action
+from auronix.models.approval import ApprovalRecord
 from auronix.models.critique import Critique
 from auronix.models.observation import Observation
 from auronix.models.plan import Plan
@@ -25,6 +26,7 @@ class TaskState:
     plan: Plan | None = None
 
     actions: list[Action] = field(default_factory=list)
+    approvals: list[ApprovalRecord] = field(default_factory=list)
     observations: list[Observation] = field(default_factory=list)
     verifications: list[Verification] = field(default_factory=list)
     critiques: list[Critique] = field(default_factory=list)

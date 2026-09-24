@@ -1,4 +1,5 @@
-from auronix.models.action import Action
+from auronix.models.action import Action, ActionStatus
+from auronix.models.approval import ApprovalRecord
 from auronix.models.critique import Critique
 from auronix.models.observation import Observation
 from auronix.models.plan import Plan
@@ -195,6 +196,120 @@ class StateEngine:
 
         self.store.save(state)
         return state
+
+    def record_approval(
+        self,
+        approval: ApprovalRecord,
+    ) -> TaskState:
+        state = self.get_task(approval.task_id)
+
+        action_exists = any(
+            action.action_id == approval.action_id
+            for action in state.actions
+        )
+
+        if not action_exists:
+            raise ValueError(
+                f"Action {approval.action_id} does not belong "
+                f"to task {approval.task_id}"
+            )
+
+        if any(
+            existing.approval_id == approval.approval_id
+            for existing in state.approvals
+        ):
+            raise ValueError(
+                f"Approval already exists: {approval.approval_id}"
+            )
+
+        state.approvals.append(approval)
+
+        state.events.append(
+            StateEvent(
+                event_type="approval.requested",
+                description=(
+                    f"Approval requested: {approval.approval_id} "
+                    f"for action {approval.action_id}"
+                ),
+            )
+        )
+
+        self.store.save(state)
+        return state
+
+    def update_approval(
+        self,
+        approval: ApprovalRecord,
+    ) -> TaskState:
+        state = self.get_task(approval.task_id)
+
+        for index, existing in enumerate(state.approvals):
+            if existing.approval_id == approval.approval_id:
+                state.approvals[index] = approval
+
+                state.events.append(
+                    StateEvent(
+                        event_type=f"approval.{approval.status.value}",
+                        description=(
+                            f"Approval {approval.approval_id} "
+                            f"is {approval.status.value}"
+                        ),
+                    )
+                )
+
+                self.store.save(state)
+                return state
+
+        raise KeyError(
+            f"Approval not found: {approval.approval_id}"
+        )
+
+    def update_action(
+        self,
+        action: Action,
+    ) -> TaskState:
+        state = self.get_task(action.task_id)
+
+        for index, existing in enumerate(state.actions):
+            if existing.action_id == action.action_id:
+                state.actions[index] = action
+                state.task.touch()
+
+                state.events.append(
+                    StateEvent(
+                        event_type="action.updated",
+                        description=(
+                            f"Action updated: {action.action_id}"
+                        ),
+                    )
+                )
+
+                self.store.save(state)
+                return state
+
+        raise KeyError(
+            f"Action not found: {action.action_id}"
+        )
+
+    def set_action_status(
+        self,
+        task_id: str,
+        action_id: str,
+        status: ActionStatus,
+    ) -> TaskState:
+        state = self.get_task(task_id)
+
+        for action in state.actions:
+            if action.action_id == action_id:
+                action.status = status
+                action.created_at = action.created_at
+
+                self.store.save(state)
+                return state
+
+        raise KeyError(
+            f"Action not found: {action_id}"
+        )
 
     def record_observation(
         self,

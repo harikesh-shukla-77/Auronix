@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from auronix.models.action import Action, ActionStatus, ActionType
+from auronix.models.approval import ApprovalRecord, ApprovalStatus
 from auronix.models.critique import Critique
 from auronix.models.observation import Observation
 from auronix.models.plan import Plan, Step
@@ -144,7 +145,35 @@ def _action_from_dict(data: dict[str, Any]) -> Action:
         risk_level=data.get("risk_level", "low"),
         permission_required=data.get("permission_required", False),
         status=ActionStatus(data.get("status", "pending")),
+        approval_id=data.get("approval_id"),
         created_at=data["created_at"],
+    )
+
+
+def _approval_to_dict(
+    approval: ApprovalRecord,
+) -> dict[str, Any]:
+    data = asdict(approval)
+    data["status"] = approval.status.value
+    return _safe_json(data)
+
+
+def _approval_from_dict(
+    data: dict[str, Any],
+) -> ApprovalRecord:
+    return ApprovalRecord(
+        approval_id=data["approval_id"],
+        task_id=data["task_id"],
+        action_id=data["action_id"],
+        action_fingerprint=data["action_fingerprint"],
+        status=ApprovalStatus(data.get("status", "pending")),
+        requested_by=data.get("requested_by", "auronix"),
+        approver=data.get("approver"),
+        reason=data.get("reason"),
+        requested_at=data["requested_at"],
+        decided_at=data.get("decided_at"),
+        expires_at=data.get("expires_at"),
+        metadata=data.get("metadata", {}),
     )
 
 
@@ -267,6 +296,10 @@ def _state_to_dict(state: TaskState) -> dict[str, Any]:
             _action_to_dict(action)
             for action in state.actions
         ],
+        "approvals": [
+            _approval_to_dict(approval)
+            for approval in state.approvals
+        ],
         "observations": [
             _observation_to_dict(observation)
             for observation in state.observations
@@ -302,6 +335,10 @@ def _state_from_dict(data: dict[str, Any]) -> TaskState:
         actions=[
             _action_from_dict(action)
             for action in data.get("actions", [])
+        ],
+        approvals=[
+            _approval_from_dict(approval)
+            for approval in data.get("approvals", [])
         ],
         observations=[
             _observation_from_dict(observation)
