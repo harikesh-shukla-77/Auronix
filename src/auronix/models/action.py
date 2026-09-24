@@ -6,6 +6,7 @@ from typing import Any
 
 class ActionStatus(str, Enum):
     PENDING = "pending"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     APPROVED = "approved"
     RUNNING = "running"
     SUCCEEDED = "succeeded"

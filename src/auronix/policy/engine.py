@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from auronix.models.action import Action, ActionType
+from auronix.models.action import Action, ActionStatus, ActionType
 
 
 class PolicyOutcome(str, Enum):
@@ -53,6 +53,14 @@ class PolicyEngine:
             return PolicyDecision(
                 outcome=PolicyOutcome.BLOCK,
                 reason=f"Unknown risk level: {action.risk_level!r}",
+            )
+
+        # An explicitly approved action may proceed even when its
+        # risk level would normally require approval.
+        if action.status == ActionStatus.APPROVED:
+            return PolicyDecision(
+                outcome=PolicyOutcome.ALLOW,
+                reason="Action has explicit approval.",
             )
 
         if action.permission_required:
