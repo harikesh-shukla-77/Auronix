@@ -6,6 +6,9 @@ from auronix.models.plan import Plan
 from auronix.models.result import Result
 from auronix.models.task import Task, TaskStatus
 from auronix.models.verification import Verification
+from auronix.tools.base import ToolResult
+from auronix.observability import log_event
+from copy import deepcopy
 
 from auronix.state.store import StateEvent, TaskState, TaskStore
 
@@ -42,6 +45,8 @@ _ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
         TaskStatus.FAILED,
     },
     TaskStatus.VERIFYING: {
+        TaskStatus.EXECUTING,
+        TaskStatus.OBSERVING,
         TaskStatus.COMPLETED,
         TaskStatus.DIAGNOSING,
         TaskStatus.REPLANNING,
@@ -133,6 +138,13 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "task_transition",
+            task_id=task_id,
+            from_status=current_status.value,
+            to_status=new_status.value,
+        )
         return state
 
     def attach_plan(self, task_id: str, plan: Plan) -> TaskState:
@@ -141,6 +153,8 @@ class StateEngine:
         if plan.task_id != task_id:
             raise ValueError("Plan task_id does not match target task.")
 
+        if state.plan is not None and state.plan != plan:
+            state.plan_history.append(deepcopy(state.plan))
         state.plan = plan
         state.task.plan_id = plan.plan_id
         state.task.touch()
@@ -153,6 +167,12 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "plan_attached",
+            task_id=task_id,
+            plan_id=plan.plan_id,
+        )
         return state
 
     def set_current_step(
@@ -185,6 +205,8 @@ class StateEngine:
 
     def record_action(self, action: Action) -> TaskState:
         state = self.get_task(action.task_id)
+        if any(existing.action_id == action.action_id for existing in state.actions):
+            raise ValueError(f"Action already recorded: {action.action_id}")
         state.actions.append(action)
 
         state.events.append(
@@ -195,6 +217,46 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "action_recorded",
+            task_id=action.task_id,
+            action_id=action.action_id,
+            step_id=action.step_id,
+            action_type=action.action_type.value,
+        )
+        return state
+
+    def record_tool_result(
+        self,
+        action: Action,
+        result: ToolResult,
+    ) -> TaskState:
+        """Persist the final action status and tool result in one state save."""
+        state = self.get_task(action.task_id)
+        for index, existing in enumerate(state.actions):
+            if existing.action_id == action.action_id:
+                state.actions[index] = action
+                break
+        else:
+            raise KeyError(f"Action not found: {action.action_id}")
+        state.tool_results[action.action_id] = result
+        state.events.append(
+            StateEvent(
+                event_type="action.result_recorded",
+                description=f"Tool result recorded for action {action.action_id}",
+            )
+        )
+        state.task.touch()
+        self.store.save(state)
+        log_event(
+            20 if result.success else 30,
+            "tool_result_recorded",
+            task_id=action.task_id,
+            action_id=action.action_id,
+            step_id=action.step_id,
+            success=result.success,
+        )
         return state
 
     def record_approval(
@@ -235,6 +297,13 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "approval_requested",
+            task_id=approval.task_id,
+            action_id=approval.action_id,
+            approval_id=approval.approval_id,
+        )
         return state
 
     def update_approval(
@@ -258,6 +327,14 @@ class StateEngine:
                 )
 
                 self.store.save(state)
+                log_event(
+                    20,
+                    "approval_decision",
+                    task_id=approval.task_id,
+                    action_id=approval.action_id,
+                    approval_id=approval.approval_id,
+                    decision=approval.status.value,
+                )
                 return state
 
         raise KeyError(
@@ -302,9 +379,22 @@ class StateEngine:
         for action in state.actions:
             if action.action_id == action_id:
                 action.status = status
-                action.created_at = action.created_at
+                state.task.touch()
+                state.events.append(
+                    StateEvent(
+                        event_type=f"action.{status.value}",
+                        description=f"Action {action_id} is {status.value}",
+                    )
+                )
 
                 self.store.save(state)
+                log_event(
+                    20,
+                    "action_status",
+                    task_id=task_id,
+                    action_id=action_id,
+                    status=status.value,
+                )
                 return state
 
         raise KeyError(
@@ -328,6 +418,13 @@ class StateEngine:
                 f"to task {observation.task_id}"
             )
 
+        existing = next(
+            (item for item in state.observations if item.action_id == observation.action_id),
+            None,
+        )
+        if existing is not None:
+            return state
+
         state.observations.append(observation)
 
         state.events.append(
@@ -341,14 +438,39 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "observation_recorded",
+            task_id=observation.task_id,
+            action_id=observation.action_id,
+        )
         return state
 
     def record_verification(
         self,
         verification: Verification,
+        *,
+        plan_id: str | None = None,
+        step_id: str | None = None,
     ) -> TaskState:
         state = self.get_task(verification.task_id)
+        if plan_id is not None:
+            verification.plan_id = plan_id
+        if step_id is not None:
+            verification.step_id = step_id
+        if any(item.verification_id == verification.verification_id for item in state.verifications):
+            return state
         state.verifications.append(verification)
+
+        if (
+            verification.passed
+            and verification.step_id
+            and state.plan
+            and verification.plan_id in {None, state.plan.plan_id}
+        ):
+            for step in state.plan.steps:
+                if step.step_id == verification.step_id:
+                    step.status = "completed"
 
         state.events.append(
             StateEvent(
@@ -361,6 +483,14 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20 if verification.passed else 30,
+            "verification_outcome",
+            task_id=verification.task_id,
+            step_id=verification.step_id,
+            passed=verification.passed,
+            confidence=verification.confidence,
+        )
         return state
 
     def record_critique(
@@ -378,6 +508,13 @@ class StateEngine:
         )
 
         self.store.save(state)
+        log_event(
+            20,
+            "critique_recorded",
+            task_id=critique.task_id,
+            critique_id=critique.critique_id,
+            source_plan_id=critique.source_plan_id,
+        )
         return state
 
     def set_result(

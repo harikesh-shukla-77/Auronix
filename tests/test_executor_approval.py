@@ -142,3 +142,44 @@ def test_executor_blocks_falsely_claimed_approval():
     assert result.success is False
     assert action.status == ActionStatus.BLOCKED
     assert spy.invocations == 0
+
+
+def test_executor_fails_closed_for_approved_action_without_engine():
+    state_engine, _, _, spy, action = setup_executor_test()
+    registry = ToolRegistry()
+    registry.register(spy)
+    executor = ToolExecutor(registry=registry)
+    action.status = ActionStatus.APPROVED
+
+    result = executor.execute(action)
+
+    assert result.success is False
+    assert action.status == ActionStatus.BLOCKED
+    assert "no approval engine" in result.error
+    assert spy.invocations == 0
+
+
+def test_executor_rejects_approval_bound_to_different_action_id():
+    state_engine, approval_engine, executor, spy, action = setup_executor_test()
+    approval = approval_engine.request(action, reason="Requires authorization")
+    approval_engine.approve(approval.approval_id, approver="admin_user")
+
+    action.action_id = "substituted-action-id"
+    result = executor.execute(action)
+
+    assert result.success is False
+    assert action.status == ActionStatus.BLOCKED
+    assert spy.invocations == 0
+
+
+def test_executor_cannot_replay_consumed_approval():
+    _, approval_engine, executor, spy, action = setup_executor_test()
+    approval = approval_engine.request(action, reason="Requires authorization")
+    approval_engine.approve(approval.approval_id, approver="admin_user")
+
+    first = executor.execute(action)
+    second = executor.execute(action)
+
+    assert first.success is True
+    assert second.success is False
+    assert spy.invocations == 1

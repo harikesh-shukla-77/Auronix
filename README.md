@@ -2,7 +2,7 @@
 
 **A controlled autonomous personal intelligence system.**
 
-Auronix enables autonomous multi-step execution under strict policy boundaries, deterministic state transitions, tamper-evident action approvals, and sandboxed tool environments.
+Auronix enables autonomous multi-step execution under policy boundaries, deterministic state transitions, tamper-evident action approvals, and restricted tool environments. Shell path checks do not provide OS-level isolation.
 
 ---
 
@@ -11,9 +11,10 @@ Auronix enables autonomous multi-step execution under strict policy boundaries, 
 - **Controlled Task Lifecycle**: Structured 15-state lifecycle machine (`Understand -> Plan -> Execute -> Observe -> Verify -> Diagnose -> Replan -> Complete`).
 - **Cryptographic Action Approval**: Actions have tamper-evident SHA-256 fingerprints. Any parameter modification after approval invalidates execution.
 - **Independent Policy Engine**: Multi-tier risk governance (`low`, `moderate`, `high`, `critical`) independent of the agent or LLM.
-- **Sandboxed Tool Execution**: Filesystem isolation with strict path-traversal prevention, read-only boundaries, and no deletion capabilities.
+- **Restricted Tool Execution**: Filesystem path checks and a conservative shell allowlist. Shell commands are not OS-sandboxed and can access host resources available to the Auronix process.
 - **Continuous Automated Verification**: Self-correcting loop evaluating step criteria, anomaly flags, and confidence scores.
 - **Persistent Event Sourcing**: Built-in SQLite storage with Write-Ahead Logging (WAL) and audit event tracking.
+- **Bounded Agent Coordination**: Dependency-ordered specialist child tasks use the existing lifecycle, executor, approvals, persistence, and verifier. See [Orchestration](docs/ORCHESTRATION.md).
 
 ---
 
@@ -31,7 +32,7 @@ Auronix enables autonomous multi-step execution under strict policy boundaries, 
 +-------------------------------+       +-------------------------------+
 |         State Engine          |       |         Tool Executor         |
 |  - Task State & Events        |       |  - Policy & Approval Checks   |
-|  - SQLite WAL / Memory Stores |       |  - Sandboxed Tools            |
+|  - SQLite WAL / Memory Stores |       |  - Restricted Tools            |
 +---------------+---------------+       +---------------+---------------+
                 |                                       |
                 v                                       v
@@ -67,7 +68,17 @@ source .venv/bin/activate
 
 # Install in editable mode
 pip install -e .
+
+# Optional Gemini support (requires GEMINI_API_KEY at runtime)
+pip install -e '.[gemini]'
 ```
+
+The CLI stores `auronix.db` in the current directory unless `--db PATH` is
+provided. Set `GEMINI_API_KEY` in the process environment before `run` or
+`resume`; the key is not accepted as a CLI option. `auronix --help`,
+`auronix --version`, and `auronix --db PATH diagnostics` provide local usage,
+version, and storage checks. See [Operations](docs/OPERATIONS.md) and
+[Security Boundaries](docs/SECURITY.md) before enabling shell tools.
 
 ---
 
@@ -96,7 +107,7 @@ task = Task(
 state_engine.create_task(task)
 ```
 
-### 2. Sandboxed Tool Execution with Policy & Approval Enforcement
+### 2. Restricted Tool Execution with Policy & Approval Enforcement
 
 ```python
 from pathlib import Path
@@ -107,7 +118,7 @@ from auronix.policy.approval import ApprovalEngine
 from auronix.tools.filesystem import FilesystemTool
 from auronix.tools.registry import ToolRegistry
 
-# Register sandboxed workspace tools
+# Register workspace path-restricted tools
 registry = ToolRegistry()
 registry.register(FilesystemTool(Path("./workspace")))
 
@@ -173,13 +184,22 @@ assert exec_result.success is True
 
 ## Running Tests
 
-Auronix includes a comprehensive pytest suite covering models, state persistence, tool sandboxing, policy enforcement, cryptographic approvals, verification, and end-to-end lifecycle integration.
+Auronix includes a pytest suite covering models, state persistence, tool restrictions, policy enforcement, action approvals, verification, and end-to-end lifecycle integration. See [Security Boundaries](docs/SECURITY.md) for shell isolation limitations.
 
 ```bash
 pytest
 ```
 
 ---
+
+## Persistent memory
+
+Optional SQLite memory stores provenance-tagged context separately from task
+state. It is untrusted evidence and cannot authorize actions. Use
+`auronix memory --help` for add/list/search/show/delete commands. See
+[docs/MEMORY.md](docs/MEMORY.md) for retention, privacy, and schema behavior.
+Provider routing is opt-in and configured by embedding applications; see
+[docs/MODEL_ROUTING.md](docs/MODEL_ROUTING.md).
 
 ## License
 

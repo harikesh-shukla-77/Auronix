@@ -38,6 +38,10 @@ class Action:
     status: ActionStatus = ActionStatus.PENDING
     approval_id: str | None = None
 
+    # Links durable execution attempts to a plan step for restart recovery.
+    plan_id: str | None = None
+    step_id: str | None = None
+
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

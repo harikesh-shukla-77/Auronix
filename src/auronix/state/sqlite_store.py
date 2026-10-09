@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import asdict
 from enum import Enum
@@ -15,7 +16,9 @@ from auronix.models.plan import Plan, Step
 from auronix.models.result import Result
 from auronix.models.task import Complexity, RiskLevel, Task, TaskStatus
 from auronix.models.verification import Verification
+from auronix.observability import log_event
 from auronix.state.store import StateEvent, TaskState, TaskStore
+from auronix.tools.base import ToolResult
 
 
 def _safe_json(value: Any) -> Any:
@@ -146,6 +149,8 @@ def _action_from_dict(data: dict[str, Any]) -> Action:
         permission_required=data.get("permission_required", False),
         status=ActionStatus(data.get("status", "pending")),
         approval_id=data.get("approval_id"),
+        plan_id=data.get("plan_id"),
+        step_id=data.get("step_id"),
         created_at=data["created_at"],
     )
 
@@ -215,6 +220,8 @@ def _verification_from_dict(
         confidence=data.get("confidence", 0.0),
         unresolved_issues=data.get("unresolved_issues", []),
         verifier=data.get("verifier", "auronix-verifier"),
+        plan_id=data.get("plan_id"),
+        step_id=data.get("step_id"),
         created_at=data["created_at"],
     )
 
@@ -240,6 +247,7 @@ def _critique_from_dict(data: dict[str, Any]) -> Critique:
         ),
         severity=data.get("severity", "low"),
         recommendation=data.get("recommendation"),
+        source_plan_id=data.get("source_plan_id"),
         created_at=data["created_at"],
     )
 
@@ -292,10 +300,15 @@ def _state_to_dict(state: TaskState) -> dict[str, Any]:
             if state.plan is not None
             else None
         ),
+        "plan_history": [_plan_to_dict(plan) for plan in state.plan_history],
         "actions": [
             _action_to_dict(action)
             for action in state.actions
         ],
+        "tool_results": {
+            action_id: _safe_json(asdict(result))
+            for action_id, result in state.tool_results.items()
+        },
         "approvals": [
             _approval_to_dict(approval)
             for approval in state.approvals
@@ -332,10 +345,15 @@ def _state_from_dict(data: dict[str, Any]) -> TaskState:
             if data.get("plan") is not None
             else None
         ),
+        plan_history=[_plan_from_dict(plan) for plan in data.get("plan_history", [])],
         actions=[
             _action_from_dict(action)
             for action in data.get("actions", [])
         ],
+        tool_results={
+            action_id: ToolResult(**result)
+            for action_id, result in data.get("tool_results", {}).items()
+        },
         approvals=[
             _approval_from_dict(approval)
             for approval in data.get("approvals", [])
@@ -367,14 +385,22 @@ def _state_from_dict(data: dict[str, Any]) -> TaskState:
 class SQLiteTaskStore(TaskStore):
     """Persistent SQLite-backed task state store."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, busy_timeout_seconds: float = 5.0) -> None:
         super().__init__()
+        if (
+            isinstance(busy_timeout_seconds, bool)
+            or not isinstance(busy_timeout_seconds, (int, float))
+            or not math.isfinite(busy_timeout_seconds)
+            or not 0 < busy_timeout_seconds <= 60
+        ):
+            raise ValueError("busy_timeout_seconds must be greater than 0 and at most 60.")
         self.path = Path(path)
+        self.busy_timeout_seconds = busy_timeout_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=self.busy_timeout_seconds)
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -426,33 +452,42 @@ class SQLiteTaskStore(TaskStore):
             separators=(",", ":"),
         )
 
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO task_state (
-                    task_id,
-                    status,
-                    plan_id,
-                    updated_at,
-                    state_json
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO task_state (
+                        task_id,
+                        status,
+                        plan_id,
+                        updated_at,
+                        state_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        status = excluded.status,
+                        plan_id = excluded.plan_id,
+                        updated_at = excluded.updated_at,
+                        state_json = excluded.state_json
+                    """,
+                    (
+                        state.task.task_id,
+                        state.task.status.value,
+                        state.plan.plan_id
+                        if state.plan is not None
+                        else None,
+                        state.task.updated_at,
+                        payload,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    status = excluded.status,
-                    plan_id = excluded.plan_id,
-                    updated_at = excluded.updated_at,
-                    state_json = excluded.state_json
-                """,
-                (
-                    state.task.task_id,
-                    state.task.status.value,
-                    state.plan.plan_id
-                    if state.plan is not None
-                    else None,
-                    state.task.updated_at,
-                    payload,
-                ),
+        except sqlite3.Error as exc:
+            log_event(
+                40,
+                "state_persistence_failure",
+                task_id=state.task.task_id,
+                error_type=type(exc).__name__,
             )
+            raise
 
     def get(self, task_id: str) -> TaskState:
         with self._connect() as connection:

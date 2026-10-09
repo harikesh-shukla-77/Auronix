@@ -1,5 +1,8 @@
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import Action, ActionStatus, ActionType
+from auronix.models.task import Task
+from auronix.policy.approval import ApprovalEngine
+from auronix.state.engine import StateEngine
 from auronix.tools.base import Tool, ToolContext, ToolResult
 from auronix.tools.registry import ToolRegistry
 
@@ -101,12 +104,21 @@ def test_explicitly_approved_high_risk_action_executes():
     tool = CountingTool()
     registry.register(tool)
 
-    action = make_action(
-        risk_level="critical",
-        status=ActionStatus.APPROVED,
+    state_engine = StateEngine()
+    task = Task(
+        task_id="TASK-POLICY-EXEC-001",
+        goal="approval test",
+        desired_outcome="execute safely",
+        success_criteria=[],
     )
+    state_engine.create_task(task)
+    action = make_action(risk_level="critical")
+    state_engine.record_action(action)
+    approval_engine = ApprovalEngine(state_engine)
+    approval = approval_engine.request(action, reason="Test approval")
+    approval_engine.approve(approval.approval_id, approver="reviewer")
 
-    result = ToolExecutor(registry).execute(action)
+    result = ToolExecutor(registry, approval_engine=approval_engine).execute(action)
 
     assert result.success is True
     assert action.status == ActionStatus.SUCCEEDED

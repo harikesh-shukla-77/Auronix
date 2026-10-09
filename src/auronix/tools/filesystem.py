@@ -25,6 +25,16 @@ class FilesystemTool(Tool):
         "Safely read and write files inside the Auronix workspace."
     )
     risk_level = "moderate"
+    parameter_schema = {
+        "type": "object",
+        "required": ["operation", "path"],
+        "properties": {
+            "operation": {"type": "string", "enum": ["read", "exists", "write", "mkdir"]},
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
 
     _READ_OPERATIONS = {"read", "exists"}
     _WRITE_OPERATIONS = {"write", "mkdir"}
@@ -149,6 +159,18 @@ class FilesystemTool(Tool):
             success=False,
             error="Unhandled filesystem operation.",
         )
+
+    def validate_parameters(self, parameters: dict[str, Any], context: ToolContext | None = None) -> None:
+        super().validate_parameters(parameters, context)
+        operation = parameters["operation"]
+        path = parameters["path"]
+        if not path.strip():
+            raise ValueError("A non-empty relative path is required.")
+        resolved = self._safe_path(path)
+        if operation == "write" and not isinstance(parameters.get("content"), str):
+            raise ValueError("Write operation requires string 'content'.")
+        if operation in self._WRITE_OPERATIONS:
+            self._ensure_write_location(path, resolved)
 
     def _safe_path(self, relative_path: str) -> Path:
         candidate = Path(relative_path)

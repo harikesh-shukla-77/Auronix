@@ -15,6 +15,7 @@ class Critique:
 
     severity: str = "low"
     recommendation: str | None = None
+    source_plan_id: str | None = None
 
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()

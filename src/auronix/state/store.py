@@ -9,6 +9,7 @@ from auronix.models.plan import Plan
 from auronix.models.result import Result
 from auronix.models.task import Task
 from auronix.models.verification import Verification
+from auronix.tools.base import ToolResult
 
 
 @dataclass
@@ -24,8 +25,10 @@ class StateEvent:
 class TaskState:
     task: Task
     plan: Plan | None = None
+    plan_history: list[Plan] = field(default_factory=list)
 
     actions: list[Action] = field(default_factory=list)
+    tool_results: dict[str, ToolResult] = field(default_factory=dict)
     approvals: list[ApprovalRecord] = field(default_factory=list)
     observations: list[Observation] = field(default_factory=list)
     verifications: list[Verification] = field(default_factory=list)

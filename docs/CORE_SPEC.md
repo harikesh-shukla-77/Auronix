@@ -1,6 +1,6 @@
 # Auronix Core Specification
 
-This document defines the formal specifications for data models, state transitions, policy and approval mechanics, tool sandboxing, and persistence within the Auronix system.
+This document defines the formal specifications for data models, state transitions, policy and approval mechanics, tool restrictions, and persistence within the Auronix system.
 
 ---
 
@@ -220,7 +220,7 @@ fingerprint = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 ---
 
-## 4. Tool & Sandboxing Specification
+## 4. Tool Restrictions Specification
 
 ### 4.1 Base Tool Contract
 Every Auronix tool must inherit from `Tool` and implement:
@@ -230,15 +230,20 @@ def execute(self, parameters: dict[str, Any], context: ToolContext) -> ToolResul
 - `ToolContext` provides `task_id`, `action_id`, and optional `working_directory`.
 - `ToolResult` returns `success: bool`, `output: Any`, `error: str | None`, `evidence: list[Any]`.
 
-### 4.2 Sandboxed Filesystem Specification (`FilesystemTool`)
+### 4.2 Workspace Path Restrictions (`FilesystemTool`)
 - **Root**: Resolved path to `workspace/`.
 - **Allowed Operations**:
   - `read`, `exists`: Allowed across `workspace/**`.
   - `write`, `mkdir`: Restricted strictly to `workspace/output/**` and `workspace/scratch/**`.
 - **Security Constraints**:
   - Absolute paths are rejected with `ValueError`.
-  - Paths resolving outside `workspace/` (e.g. `../`) raise sandbox escape errors.
+  - Paths resolving outside `workspace/` (e.g. `../`) are rejected. This path validation is not an OS-level sandbox and remains subject to filesystem races.
   - Deletions (`unlink`, `rmdir`) are strictly unsupported.
+
+### 4.3 Shell Execution Boundary (`ShellTool`)
+- Shell commands run without a shell parser (`shell=False`) and use an executable allowlist, argument restrictions, bounded output, and finite timeouts.
+- Workspace path checks are not an OS-level sandbox. The child process runs with the Auronix user's operating-system permissions and may access host resources through allowed executable behavior.
+- OS isolation must be provided externally before this tool is used with untrusted goals in a hostile environment.
 
 ---
 

@@ -1,6 +1,6 @@
 # Auronix Architecture
 
-Auronix is a **controlled autonomous personal intelligence system**. It is designed to safely execute multi-step objectives under deterministic state boundaries, sandboxed tool execution, and cryptographic action governance.
+Auronix is a **controlled autonomous personal intelligence system**. It is designed to execute multi-step objectives under deterministic state boundaries, restricted tool execution, and action approval governance. Shell path checks are not OS-level isolation.
 
 ---
 
@@ -32,7 +32,7 @@ The system is organized into modular layers:
 +-------------------------------+       +-------------------------------+
 |         State Engine          |       |         Tool Executor         |
 |  - Task State & Events        |       |  - Tool Registry              |
-|  - Transitions & Invariants   |       |  - Sandboxed Filesystem       |
+|  - Transitions & Invariants   |       |  - Restricted Filesystem      |
 |  - SQLite / Memory Stores     |       +---------------+---------------+
 +---------------+---------------+                       |
                 |                                       |
@@ -76,18 +76,35 @@ The system is organized into modular layers:
   - Approves or rejects requests with approver identity and timestamp.
   - Enforces `is_valid_for_execution`: verifies approval status, fingerprint equality (detecting parameter tampering), and expiration TTL.
 
-### 3.5 Execution & Tool Sandboxing (`auronix.execution`, `auronix.tools`)
+### 3.5 Execution & Tool Restrictions (`auronix.execution`, `auronix.tools`)
 - **`ToolExecutor`**: Executes tool calls while strictly enforcing `PolicyEngine` rules and validating approvals with `ApprovalEngine`.
 - **`ToolRegistry`**: Central registry maintaining available tool instances.
-- **`FilesystemTool`**: Sandboxed workspace file operations:
+- **`FilesystemTool`**: Workspace path-checked file operations:
   - Read access permitted across `workspace/**`.
   - Write access restricted to `workspace/output/**` and `workspace/scratch/**`.
   - Path traversal outside workspace root is blocked.
   - File deletions are deliberately unsupported.
+- **`ShellTool`**: Uses a small executable allowlist, argument checks, bounded output, and timeouts. It is not an OS sandbox; commands retain the Auronix process user's host permissions.
 
 ### 3.6 Verification Engine (`auronix.verification`)
 - **`Verifier`**: Evaluates step success criteria against observations, action results, and evidence.
 - Flags observation anomalies, calculates confidence scores, identifies unresolved issues, and enables pluggable custom checks.
+
+### 3.7 Multi-agent Orchestration (`auronix.agents.orchestration`)
+- **`AgentOrchestrator`**: Persists a bounded child-task plan, dispatches specialists in dependency order through child `LifecycleEngine` instances, and verifies the aggregate parent result.
+- **`PlannerAgent`, `SpecialistAgent`, `ReviewerAgent`**: Typed in-process interfaces for decomposition, child proposals, and bounded review. Specialist tool intents are converted to actions only by the orchestrator and routed through `ToolExecutor`.
+- Agent callbacks are trusted Python code, not isolated processes. Timeout bounds the controller's wait; Python threads cannot be forcibly stopped. See [ORCHESTRATION.md](ORCHESTRATION.md).
+
+### 3.8 Persistent Memory (`auronix.memory`)
+- **`SQLiteMemoryStore`**: Stores provenance-tagged contextual entries in a separate schema in SQLite, with bounded size/retention and relevance search.
+- Memory remains untrusted context and cannot change task state, policy, or approvals. See [MEMORY.md](MEMORY.md).
+
+### 3.9 Model Routing (`auronix.agents.routing`)
+- **`ModelRouter`**: Selects from explicitly configured provider/model routes by task type and capabilities; explicit fallbacks, bounded retries, timeouts, and dry-run inspection are supported.
+- Gemini lifecycle integration is optional. Live provider behavior, provider costs, and deployment-specific route configuration are not validated here. See [MODEL_ROUTING.md](MODEL_ROUTING.md).
+
+### 3.10 Local CLI and operations
+- **`auronix.interfaces.cli`**: Task, approval, memory, and read-only diagnostics commands. The CLI does not expose a remote service. See [OPERATIONS.md](OPERATIONS.md).
 
 ---
 
@@ -158,7 +175,7 @@ sequenceDiagram
     participant Exec as ToolExecutor
     participant Pol as PolicyEngine
     participant Appr as ApprovalEngine
-    participant Tool as Sandboxed Tool
+    participant Tool as Restricted Tool
     participant User as Human Approver
 
     Agent->>Exec: execute(action)
@@ -197,8 +214,17 @@ sequenceDiagram
 Auronix/
 ├── docs/
 │   ├── ARCHITECTURE.md          # Architecture and design principles
-│   └── CORE_SPEC.md             # Data model, transition, and security specifications
+│   ├── CORE_SPEC.md             # Data model, transition, and security specifications
+│   ├── SECURITY.md              # Security boundaries and residual risks
+│   ├── ORCHESTRATION.md         # Multi-agent execution boundary
+│   ├── MEMORY.md                # Persistent contextual memory
+│   ├── MODEL_ROUTING.md         # Explicit provider routing
+│   └── OPERATIONS.md            # Local operations and recovery
 ├── src/auronix/
+│   ├── agents/                  # Gemini handlers, orchestration, routing
+│   ├── memory/                  # SQLite contextual memory
+│   ├── interfaces/              # Local CLI
+│   ├── observability.py         # Structured lifecycle events
 │   ├── core/
 │   │   └── lifecycle.py         # LifecycleEngine & LifecycleHandlers
 │   ├── models/
@@ -220,7 +246,7 @@ Auronix/
 │   ├── tools/
 │   │   ├── base.py              # Tool, ToolContext, ToolResult
 │   │   ├── registry.py          # ToolRegistry
-│   │   └── filesystem.py        # Sandboxed FilesystemTool
+│   │   └── filesystem.py        # Workspace path-checked FilesystemTool
 │   ├── execution/
 │   │   └── executor.py          # ToolExecutor with policy & approval validation
 │   └── verification/
