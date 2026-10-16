@@ -234,6 +234,7 @@ class StateEngine:
     ) -> TaskState:
         """Persist the final action status and tool result in one state save."""
         state = self.get_task(action.task_id)
+        snapshot = deepcopy(state)
         for index, existing in enumerate(state.actions):
             if existing.action_id == action.action_id:
                 state.actions[index] = action
@@ -248,7 +249,19 @@ class StateEngine:
             )
         )
         state.task.touch()
-        self.store.save(state)
+        try:
+            self.store.save(state)
+        except Exception:
+            # The in-memory store keeps shared objects, so undo the mutation
+            # when persistence fails. A caller must not observe an unconfirmed
+            # result as though it were durable.
+            state.__dict__.update(snapshot.__dict__)
+            for stored_action in state.actions:
+                if stored_action.action_id == action.action_id:
+                    stored_action.status = ActionStatus.RUNNING
+                    break
+            action.status = ActionStatus.RUNNING
+            raise
         log_event(
             20 if result.success else 30,
             "tool_result_recorded",
@@ -532,4 +545,34 @@ class StateEngine:
         )
 
         self.store.save(state)
+        return state
+
+    def complete(self, result: Result) -> TaskState:
+        """Persist the successful result and terminal status in one state save."""
+        state = self.get_task(result.task_id)
+        if state.task.status != TaskStatus.VERIFYING:
+            raise ValueError("Only a verified task can be completed.")
+        snapshot = deepcopy(state)
+        state.result = result
+        state.task.status = TaskStatus.COMPLETED
+        state.task.touch()
+        state.events.extend((
+            StateEvent(
+                event_type="task.status_changed",
+                description="verifying -> completed: all plan steps completed and verified",
+            ),
+            StateEvent(
+                event_type="result.recorded",
+                description=f"Result recorded: {result.result_id}",
+            ),
+        ))
+        try:
+            self.store.save(state)
+        except Exception:
+            # In-memory stores can retain the same object even when save fails.
+            state.__dict__.update(snapshot.__dict__)
+            raise
+        log_event(20, "task_transition", task_id=result.task_id,
+                  from_status=TaskStatus.VERIFYING.value,
+                  to_status=TaskStatus.COMPLETED.value)
         return state

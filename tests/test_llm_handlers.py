@@ -1,7 +1,7 @@
 import os
 from unittest.mock import MagicMock
 import pytest
-from auronix.agents.llm_handlers import build_gemini_handlers
+from auronix.agents.llm_handlers import GeminiLifecycleHandlersBuilder, build_gemini_handlers
 from auronix.core.lifecycle import LifecycleEngine
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import ActionStatus
@@ -53,7 +53,7 @@ def test_build_gemini_handlers_with_mock_client():
 
 
 def test_gemini_client_timeout_is_configurable(monkeypatch):
-    from google import genai
+    genai = pytest.importorskip("google.genai")
 
     captured = {}
 
@@ -130,7 +130,7 @@ def test_gemini_plan_rejects_parameters_outside_tool_schema():
 
 def test_gemini_provider_failure_and_retries():
     mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = Exception("API connection error")
+    mock_client.models.generate_content.side_effect = TimeoutError("API connection error")
 
     handlers = build_gemini_handlers(client=mock_client)
     task = Task(task_id="task-1", goal="Goal", desired_outcome="Outcome", success_criteria=[])
@@ -138,6 +138,88 @@ def test_gemini_provider_failure_and_retries():
     with pytest.raises(ValueError, match="Failed to obtain valid JSON response from Gemini model"):
         handlers.plan(task)
     assert mock_client.models.generate_content.call_count == 3
+
+
+def test_provider_permanent_failure_is_not_retried_and_message_is_sanitized(caplog):
+    import logging
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = ValueError(
+        "FAKE_PROVIDER_SECRET bearer FAKE_BEARER_12 password FAKE_PASSWORD_34"
+    )
+    handlers = build_gemini_handlers(client=mock_client, max_retries=3)
+    task = Task("permanent-provider-failure", "goal", "outcome", [])
+
+    with caplog.at_level(logging.DEBUG, logger="auronix"):
+        with pytest.raises(ValueError, match="permanently") as error:
+            handlers.plan(task)
+    assert "FAKE_PROVIDER_SECRET" not in str(error.value)
+    for marker in ("FAKE_PROVIDER_SECRET", "FAKE_BEARER_12", "FAKE_PASSWORD_34"):
+        assert marker not in caplog.text
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_transient_provider_failure_retries_then_succeeds_without_logging_secrets(caplog):
+    import logging
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [
+        TimeoutError("FAKE_EXCEPTION_CREDENTIAL_4a"),
+        MagicMock(text='{"summary":"ok"}'),
+    ]
+    handlers = GeminiLifecycleHandlersBuilder(client=mock_client, max_retries=2)
+
+    with caplog.at_level(logging.DEBUG, logger="auronix"):
+        assert handlers._call_model("FAKE_FULL_PROMPT_5b") == {"summary": "ok"}
+    assert mock_client.models.generate_content.call_count == 2
+    assert "FAKE_FULL_PROMPT_5b" not in caplog.text
+    assert "FAKE_EXCEPTION_CREDENTIAL_4a" not in caplog.text
+    assert "provider_attempt_failed" in caplog.text
+
+
+@pytest.mark.parametrize("status", [408, 429, 503])
+def test_structured_transient_provider_status_retries(status):
+    class ProviderStatusError(Exception):
+        def __init__(self, value):
+            self.status_code = value
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [
+        ProviderStatusError(status),
+        MagicMock(text='{"summary":"ok"}'),
+    ]
+    handlers = GeminiLifecycleHandlersBuilder(client=mock_client, max_retries=1)
+
+    assert handlers._call_model("offline prompt") == {"summary": "ok"}
+    assert mock_client.models.generate_content.call_count == 2
+
+
+def test_provider_authentication_status_is_not_retried():
+    class ProviderStatusError(Exception):
+        status_code = 401
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = ProviderStatusError("unauthorized")
+    handlers = GeminiLifecycleHandlersBuilder(client=mock_client, max_retries=3)
+
+    with pytest.raises(ValueError, match="permanently"):
+        handlers._call_model("offline prompt")
+    assert mock_client.models.generate_content.call_count == 1
+
+
+def test_malformed_provider_output_is_permanent_and_not_retried(caplog):
+    import logging
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = "FAKE_PROVIDER_PAYLOAD_56"
+    handlers = GeminiLifecycleHandlersBuilder(client=mock_client, max_retries=3)
+
+    with caplog.at_level(logging.DEBUG, logger="auronix"):
+        with pytest.raises(ValueError, match="permanently"):
+            handlers._call_model("FAKE_FULL_PROMPT")
+    assert "FAKE_PROVIDER_PAYLOAD_56" not in caplog.text
+    assert "FAKE_FULL_PROMPT" not in caplog.text
+    assert mock_client.models.generate_content.call_count == 1
 
 
 @pytest.mark.parametrize(

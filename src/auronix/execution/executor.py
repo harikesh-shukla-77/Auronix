@@ -232,7 +232,14 @@ class ToolExecutor:
             else ActionStatus.FAILED
         )
 
-        self._persist_result(action, result)
+        try:
+            self._persist_result(action, result)
+        except Exception:
+            # The external call may have completed, but its outcome was not
+            # durably checkpointed. Keep the action ambiguous so recovery
+            # cannot mistake it for a persisted success or repeat it.
+            action.status = ActionStatus.RUNNING
+            raise
         log_event(
             20 if result.success else 30,
             "execution_finished",
@@ -267,13 +274,4 @@ class ToolExecutor:
     def _persist_result(self, action: Action, result: ToolResult) -> None:
         if self.state_engine is None:
             return
-        try:
-            self.state_engine.record_tool_result(action, result)
-        except (KeyError, ValueError, OSError) as exc:
-            log_event(
-                40,
-                "execution_result_checkpoint_failed",
-                task_id=action.task_id,
-                action_id=action.action_id,
-                error_type=type(exc).__name__,
-            )
+        self.state_engine.record_tool_result(action, result)

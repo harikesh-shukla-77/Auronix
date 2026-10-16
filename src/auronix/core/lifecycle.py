@@ -41,6 +41,10 @@ class LifecycleHandlers:
     replan: Callable[[object, Plan, Critique], Plan]
 
 
+class RetryableLifecycleError(Exception):
+    """Explicitly classified transient failure from a lifecycle handler."""
+
+
 class LifecycleEngine:
     """
     Runs the high-level Auronix task lifecycle.
@@ -424,12 +428,7 @@ class LifecycleEngine:
                 continue
 
             result = self._build_result(task_id)
-            self.state_engine.set_result(result)
-            self._transition(
-                task_id,
-                TaskStatus.COMPLETED,
-                "all plan steps completed and verified",
-            )
+            self.state_engine.complete(result)
             return result
 
     @staticmethod
@@ -692,6 +691,9 @@ class LifecycleEngine:
                 log_event(20, "handler_attempt", task_id=task_id, operation=operation, attempt=attempt)
                 return callback()
             except Exception as exc:
+                if not isinstance(exc, (RetryableLifecycleError, TimeoutError, ConnectionError)):
+                    self._fail_task(task_id, f"{operation} failed permanently.")
+                    raise
                 log_event(30, "handler_retryable_failure", task_id=task_id, operation=operation, attempt=attempt, error_type=type(exc).__name__)
                 if attempt > self.max_retries:
                     self._fail_task(task_id, f"{operation} failed after bounded retries.")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict
 from enum import Enum
 from pathlib import Path
@@ -404,8 +405,17 @@ class SQLiteTaskStore(TaskStore):
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -453,7 +463,7 @@ class SQLiteTaskStore(TaskStore):
         )
 
         try:
-            with self._connect() as connection:
+            with self._connection() as connection:
                 connection.execute(
                     """
                     INSERT INTO task_state (
@@ -490,7 +500,7 @@ class SQLiteTaskStore(TaskStore):
             raise
 
     def get(self, task_id: str) -> TaskState:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT state_json
@@ -506,7 +516,7 @@ class SQLiteTaskStore(TaskStore):
         return _state_from_dict(json.loads(row["state_json"]))
 
     def exists(self, task_id: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT 1
@@ -520,7 +530,7 @@ class SQLiteTaskStore(TaskStore):
         return row is not None
 
     def all(self) -> list[TaskState]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT state_json
@@ -535,7 +545,7 @@ class SQLiteTaskStore(TaskStore):
         ]
 
     def delete(self, task_id: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM task_state

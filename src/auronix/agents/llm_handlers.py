@@ -20,6 +20,26 @@ from auronix.tools.base import ToolContext, ToolResult
 from auronix.tools.registry import ToolRegistry
 
 
+class RetryableProviderError(Exception):
+    """Explicitly classified transient provider failure."""
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    if isinstance(exc, (RetryableProviderError, TimeoutError, ConnectionError)):
+        return True
+    # Provider SDKs expose HTTP status values on structured exceptions. Retry
+    # only known transient responses; authentication and validation statuses
+    # remain permanent.
+    for attribute in ("status_code", "code"):
+        status = getattr(exc, attribute, None)
+        if hasattr(status, "value"):
+            status = status.value
+        if isinstance(status, int) and not isinstance(status, bool):
+            if status in {408, 429} or 500 <= status <= 599:
+                return True
+    return False
+
+
 def _clean_json_text(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -168,9 +188,14 @@ class GeminiLifecycleHandlersBuilder:
                     text = reply.text
                     provider_name, model_name = reply.provider, reply.model
                 else:
-                    from google.genai import types
+                    try:
+                        from google.genai import types
 
-                    config = types.GenerateContentConfig(response_mime_type="application/json")
+                        config = types.GenerateContentConfig(response_mime_type="application/json")
+                    except ImportError:
+                        # Injected offline clients can exercise handler behavior
+                        # without installing the optional Gemini SDK.
+                        config = {"response_mime_type": "application/json"}
                     response = self.client.models.generate_content(
                         model=self.model, contents=prompt, config=config
                     )
@@ -185,6 +210,12 @@ class GeminiLifecycleHandlersBuilder:
                     f"Model response is not a JSON object: {type(parsed).__name__}"
                 )
             except Exception as exc:
+                if not _is_retryable_provider_error(exc):
+                    log_event(40, "provider_request_rejected", provider="configured",
+                              attempt=attempt + 1, error_type=type(exc).__name__)
+                    raise ValueError(
+                        f"Provider request failed permanently ({type(exc).__name__})."
+                    ) from None
                 last_error = exc
                 log_event(30, "provider_attempt_failed", provider="configured", attempt=attempt + 1, error_type=type(exc).__name__)
                 attempt += 1
