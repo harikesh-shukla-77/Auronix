@@ -14,6 +14,11 @@ from auronix.models.result import Result
 from auronix.models.task import TaskStatus
 from auronix.models.verification import Verification
 from auronix.observability import log_event
+from auronix.core.retry_budget import (
+    _RetryBudgetExhausted,
+    consume_retry_attempt,
+    execution_budgeted,
+)
 from auronix.policy.approval import action_fingerprint
 from auronix.state.engine import StateEngine
 from auronix.tools.base import ToolResult
@@ -71,6 +76,7 @@ class LifecycleEngine:
         self.max_retries = max_retries
         self.max_replans = max_replans
 
+    @execution_budgeted
     def run(self, task_id: str) -> Result:
         state = self.state_engine.get_task(task_id)
 
@@ -136,6 +142,7 @@ class LifecycleEngine:
 
         return self._execute_loop(task_id)
 
+    @execution_budgeted
     def resume(self, task_id: str) -> Result:
         state = self.state_engine.get_task(task_id)
 
@@ -307,6 +314,9 @@ class LifecycleEngine:
                     )
                     try:
                         action = self.handlers.execute(state.task, step)
+                    except _RetryBudgetExhausted:
+                        self._finalize_retry_budget_exhaustion(task_id)
+                        raise
                     except Exception as exc:
                         log_event(
                             40,
@@ -688,8 +698,16 @@ class LifecycleEngine:
     def _call_recoverable(self, task_id: str, operation: str, callback):
         for attempt in range(1, self.max_retries + 2):
             try:
+                consume_retry_attempt("lifecycle_handler")
+            except _RetryBudgetExhausted:
+                self._finalize_retry_budget_exhaustion(task_id)
+                raise
+            try:
                 log_event(20, "handler_attempt", task_id=task_id, operation=operation, attempt=attempt)
                 return callback()
+            except _RetryBudgetExhausted:
+                self._finalize_retry_budget_exhaustion(task_id)
+                raise
             except Exception as exc:
                 if not isinstance(exc, (RetryableLifecycleError, TimeoutError, ConnectionError)):
                     self._fail_task(task_id, f"{operation} failed permanently.")
@@ -707,6 +725,16 @@ class LifecycleEngine:
                 self._build_failed_result(task_id),
                 reason,
             )
+
+    def _finalize_retry_budget_exhaustion(self, task_id: str) -> None:
+        reason = "Execution retry attempt budget exhausted."
+        log_event(
+            40,
+            "lifecycle_failure",
+            task_id=task_id,
+            reason_code="execution_retry_budget_exhausted",
+        )
+        self.state_engine.finalize_failure(self._build_failed_result(task_id), reason)
 
     def _build_failed_result(self, task_id: str) -> Result:
         return Result(

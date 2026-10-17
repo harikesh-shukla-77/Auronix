@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from contextvars import copy_context
 from dataclasses import dataclass
 import threading
 from typing import Protocol
 
 from auronix.observability import log_event
+from auronix.core.retry_budget import (
+    _RetryBudgetExhausted,
+    consume_retry_attempt,
+    execution_budgeted,
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,7 @@ class ModelRouter:
             raise ModelRoutingError(f"No enabled route satisfies task type '{request.task_type}' and requested capabilities.")
         return tuple(selected)
 
+    @execution_budgeted
     def complete(self, request: ModelRequest) -> ModelReply:
         routes = self.inspect(request)
         errors: list[str] = []
@@ -122,6 +129,7 @@ class ModelRouter:
                 errors.append(f"{route.name}:provider_unavailable")
                 continue
             for attempt in range(route.max_retries + 1):
+                consume_retry_attempt("model_route")
                 log_event(20, "model_route_selected", task_type=request.task_type, route=route.name, provider=route.provider, model=route.model, attempt=attempt + 1)
                 if not self._call_slots.acquire(timeout=route.timeout_seconds):
                     errors.append(f"{route.name}:capacity_exhausted")
@@ -137,7 +145,13 @@ class ModelRouter:
                             result.set_exception(exc)
                         finally:
                             self._call_slots.release()
-                    thread = threading.Thread(target=invoke, daemon=True, name="auronix-model-call")
+                    provider_context = copy_context()
+                    thread = threading.Thread(
+                        target=provider_context.run,
+                        args=(invoke,),
+                        daemon=True,
+                        name="auronix-model-call",
+                    )
                     thread.start()
                     text = result.result(timeout=route.timeout_seconds)
                     if not isinstance(text, str) or not text.strip():
@@ -147,6 +161,8 @@ class ModelRouter:
                     errors.append(f"{route.name}:timeout")
                     log_event(30, "model_route_failed", task_type=request.task_type, route=route.name, error_type="TimeoutError")
                     break
+                except _RetryBudgetExhausted:
+                    raise
                 except Exception as exc:
                     errors.append(f"{route.name}:{type(exc).__name__}")
                     log_event(30, "model_route_failed", task_type=request.task_type, route=route.name, error_type=type(exc).__name__)

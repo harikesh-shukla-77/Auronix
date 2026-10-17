@@ -7,6 +7,11 @@ from typing import Any
 from uuid import uuid4
 
 from auronix.core.lifecycle import LifecycleEngine, LifecycleHandlers
+from auronix.core.retry_budget import (
+    _RetryBudgetExhausted,
+    consume_retry_attempt,
+    execution_budgeted,
+)
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.models.critique import Critique
@@ -178,11 +183,13 @@ class GeminiLifecycleHandlersBuilder:
         self.latest_results: dict[str, ToolResult] = {}
         self.latest_results_by_task: dict[str, ToolResult] = {}
 
+    @execution_budgeted
     def _call_model(self, prompt: str, *, task_type: str = "planning") -> dict[str, Any]:
         attempt = 0
         last_error = None
         while attempt <= self.max_retries:
             try:
+                consume_retry_attempt("provider_request")
                 if self.model_router is not None:
                     reply = self.model_router.complete(ModelRequest(task_type=task_type, prompt=prompt))
                     text = reply.text
@@ -209,6 +216,8 @@ class GeminiLifecycleHandlersBuilder:
                 raise ValueError(
                     f"Model response is not a JSON object: {type(parsed).__name__}"
                 )
+            except _RetryBudgetExhausted:
+                raise
             except Exception as exc:
                 if not _is_retryable_provider_error(exc):
                     log_event(40, "provider_request_rejected", provider="configured",
@@ -240,6 +249,8 @@ class GeminiLifecycleHandlersBuilder:
             if not isinstance(considerations, list) or not all(isinstance(x, str) for x in considerations):
                 raise ValueError("Understanding key_considerations must be a list of strings.")
             task.metadata["understanding"] = {"summary": summary, "key_considerations": considerations}
+        except _RetryBudgetExhausted:
+            raise
         except Exception as exc:
             raise ValueError(f"Gemini task understanding failed ({type(exc).__name__}).") from exc
 

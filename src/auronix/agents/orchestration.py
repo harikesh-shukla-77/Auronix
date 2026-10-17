@@ -8,11 +8,13 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from contextvars import copy_context
 from enum import Enum
 from typing import Protocol
 from uuid import uuid4
 
 from auronix.core.lifecycle import LifecycleEngine, LifecycleHandlers
+from auronix.core.retry_budget import consume_retry_attempt, execution_budgeted
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.models.critique import Critique
@@ -169,6 +171,7 @@ class AgentOrchestrator:
         self._deadline = 0.0
         self.verifier = Verifier("agent-orchestrator-verifier")
 
+    @execution_budgeted
     def run(self, task_id: str) -> OrchestrationOutcome:
         self._deadline = time.monotonic() + self.max_runtime_seconds
         state = self.state_engine.get_task(task_id)
@@ -462,11 +465,6 @@ class AgentOrchestrator:
         return OrchestrationOutcome(status, result, tuple(child_ids))
 
     def _fail_parent(self, task_id: str, child_ids: list[str], reason: str) -> OrchestrationOutcome:
-        state = self.state_engine.get_task(task_id)
-        if state.task.status not in {TaskStatus.FAILED, TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
-            if state.task.status == TaskStatus.PAUSED:
-                self.state_engine.transition(task_id, TaskStatus.EXECUTING, "child failure during resumed orchestration")
-            self.state_engine.transition(task_id, TaskStatus.FAILED, reason)
         result = Result(
             result_id=f"orchestration-result-{task_id}",
             task_id=task_id,
@@ -474,7 +472,7 @@ class AgentOrchestrator:
             verification_status="failed",
             completion_status="failed",
         )
-        self.state_engine.set_result(result)
+        self.state_engine.finalize_failure(result, reason)
         return OrchestrationOutcome("failed", result, tuple(child_ids))
 
     def _ensure_children(self, parent: Task, plan: AgentPlan) -> None:
@@ -555,6 +553,7 @@ class AgentOrchestrator:
         """Run pure agent callbacks in daemon threads with finite wait/retries."""
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            consume_retry_attempt("agent_callback")
             result_queue: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
 
             def invoke() -> None:
@@ -563,7 +562,10 @@ class AgentOrchestrator:
                 except BaseException as exc:
                     result_queue.put((False, exc))
 
-            thread = threading.Thread(target=invoke, daemon=True)
+            callback_context = copy_context()
+            thread = threading.Thread(
+                target=callback_context.run, args=(invoke,), daemon=True
+            )
             thread.start()
             try:
                 ok, value = result_queue.get(timeout=self._remaining_timeout())
