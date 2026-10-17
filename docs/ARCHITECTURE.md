@@ -12,7 +12,7 @@ Auronix is engineered around five fundamental principles:
 2. **Decoupled Policy & Intelligence**: The policy engine and approval mechanisms are strictly independent from model generation, planning logic, and tool code. An agent cannot declare its own actions safe or bypass policy rules.
 3. **Deterministic State Transitions**: Tasks follow a formal finite state machine. Every lifecycle progression is verified and recorded as an auditable state event.
 4. **Continuous Verification & Self-Correction**: Execution is an active loop of `Execute -> Observe -> Verify`. If verification fails, the system transitions to `DIAGNOSING` (critique) and `REPLANNING` rather than looping blindly.
-5. **Persistent Event-Sourced Auditability**: All tasks, plans, actions, approvals, observations, verifications, and state transitions are stored in durable, queryable storage (SQLite with Write-Ahead Logging).
+5. **Persistent State and Event History**: Tasks, plans, actions, approvals, observations, verifications, and state-transition records are stored in durable task-state snapshots (SQLite with Write-Ahead Logging).
 
 ---
 

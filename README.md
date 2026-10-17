@@ -13,7 +13,7 @@ Auronix enables autonomous multi-step execution under policy boundaries, determi
 - **Independent Policy Engine**: Multi-tier risk governance (`low`, `moderate`, `high`, `critical`) independent of the agent or LLM.
 - **Restricted Tool Execution**: Filesystem path checks and a conservative shell allowlist. Shell commands are not OS-sandboxed and can access host resources available to the Auronix process.
 - **Continuous Automated Verification**: Self-correcting loop evaluating step criteria, anomaly flags, and confidence scores.
-- **Persistent Event Sourcing**: Built-in SQLite storage with Write-Ahead Logging (WAL) and audit event tracking.
+- **Persistent State and Event History**: Built-in SQLite task-state snapshots with Write-Ahead Logging (WAL) and recorded lifecycle events.
 - **Bounded Agent Coordination**: Dependency-ordered specialist child tasks use the existing lifecycle, executor, approvals, persistence, and verifier. See [Orchestration](docs/ORCHESTRATION.md).
 
 ---
