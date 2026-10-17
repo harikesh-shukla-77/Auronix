@@ -1,7 +1,5 @@
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.models.approval import ApprovalStatus
 from auronix.models.task import Task

@@ -7,7 +7,6 @@ from auronix.models.critique import Critique
 from auronix.models.observation import Observation
 from auronix.models.plan import Plan, Step
 from auronix.models.task import Task, TaskStatus
-from auronix.models.verification import Verification
 from auronix.policy.approval import ApprovalEngine
 from auronix.policy.engine import PolicyEngine
 from auronix.state.engine import StateEngine

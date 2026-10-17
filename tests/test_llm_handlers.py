@@ -1,4 +1,3 @@
-import os
 import threading
 from unittest.mock import MagicMock
 import pytest
@@ -10,8 +9,6 @@ from auronix.agents.llm_handlers import (
 from auronix.core.lifecycle import LifecycleEngine
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import ActionStatus
-from auronix.models.critique import Critique
-from auronix.models.plan import Plan, Step
 from auronix.models.task import Task, TaskStatus
 from auronix.policy.approval import ApprovalEngine
 from auronix.policy.engine import PolicyEngine

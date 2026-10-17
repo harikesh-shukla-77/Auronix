@@ -204,8 +204,6 @@ def test_run_and_resume_pause_for_and_enforce_approval(
 ):
     db = tmp_path / "state.db"
     task_id = create_task(db, capsys, "write an approved artifact")
-    state_engine = StateEngine(SQLiteTaskStore(db))
-    approval_engine = ApprovalEngine(state_engine)
 
     def make_handlers(engine, approvals):
         def plan(task: Task) -> Plan:
