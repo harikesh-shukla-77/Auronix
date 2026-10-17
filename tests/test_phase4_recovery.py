@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from auronix.core.lifecycle import LifecycleEngine, LifecycleHandlers
@@ -224,6 +227,56 @@ def test_restart_blocks_ambiguous_running_action_without_reexecution(tmp_path):
     assert tool.calls == 0
 
 
+def test_os_process_exit_after_tool_effect_leaves_durable_ambiguous_action(tmp_path):
+    database = tmp_path / "process-exit.db"
+    marker = tmp_path / "external-effect.txt"
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    script = f'''\
+import os, sys
+from pathlib import Path
+sys.path.insert(0, {source_root!r})
+from auronix.execution.executor import ToolExecutor
+from auronix.models.action import Action, ActionType
+from auronix.models.plan import Plan, Step
+from auronix.models.task import Task, TaskStatus
+from auronix.policy.engine import PolicyEngine
+from auronix.state.engine import StateEngine
+from auronix.state.sqlite_store import SQLiteTaskStore
+from auronix.tools.base import Tool, ToolContext
+from auronix.tools.registry import ToolRegistry
+
+class ExitAfterEffect(Tool):
+    name = "exit_after_effect"
+    description = "Simulates a process exit after an external effect"
+    def execute(self, parameters, context):
+        Path({str(marker)!r}).write_text("effect completed")
+        os._exit(73)
+
+state = StateEngine(SQLiteTaskStore({str(database)!r}))
+task = Task("process-exit", "test recovery", "safe", [])
+state.create_task(task)
+state.transition(task.task_id, TaskStatus.UNDERSTANDING, "test setup")
+state.transition(task.task_id, TaskStatus.PLANNING, "test setup")
+state.attach_plan(task.task_id, Plan("process-plan", task.task_id, task.goal, [Step("step", "run tool", suggested_tool="exit_after_effect")]))
+state.transition(task.task_id, TaskStatus.EXECUTING, "test setup")
+state.set_current_step(task.task_id, "step")
+registry = ToolRegistry()
+registry.register(ExitAfterEffect())
+action = Action("process-action", task.task_id, ActionType.TOOL_CALL, "run tool", target="exit_after_effect", plan_id="process-plan", step_id="step")
+ToolExecutor(registry, PolicyEngine(), state_engine=state).execute(action, context=ToolContext(task.task_id, action.action_id))
+raise SystemExit("tool process did not exit")
+'''
+
+    process = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+
+    assert process.returncode == 73, process.stderr
+    assert marker.read_text() == "effect completed"
+    recovered = SQLiteTaskStore(database).get("process-exit")
+    assert recovered.task.status == TaskStatus.EXECUTING
+    assert recovered.actions[0].status == ActionStatus.RUNNING
+    assert recovered.tool_results == {}
+
+
 def test_transient_planning_failure_retries_with_a_finite_limit():
     state = StateEngine()
     task = Task("retry-task", "recover planning", "complete", ["verified"])
@@ -244,6 +297,7 @@ def test_transient_planning_failure_retries_with_a_finite_limit():
         return original_plan(current_task)
 
     handlers.plan = transient_plan
+    handlers.replay_safe_operations = frozenset({"planning"})
     result = LifecycleEngine(state, handlers, max_retries=1).run(task.task_id)
 
     assert result.completion_status == "complete"
@@ -268,6 +322,7 @@ def test_exhausted_planning_retries_fail_the_task_safely():
         raise TimeoutError("provider failure")
 
     handlers.plan = failing_plan
+    handlers.replay_safe_operations = frozenset({"planning"})
     try:
         LifecycleEngine(state, handlers, max_retries=2).run(task.task_id)
     except TimeoutError:
@@ -278,6 +333,98 @@ def test_exhausted_planning_retries_fail_the_task_safely():
     assert calls == 3
     assert state.get_task(task.task_id).task.status == TaskStatus.FAILED
     assert tool.calls == 0
+
+
+def test_unmarked_lifecycle_callback_is_not_replayed_after_ambiguous_error():
+    state = StateEngine()
+    task = Task("unmarked-callback", "fail safely", "do not duplicate", [])
+    state.create_task(task)
+    registry = ToolRegistry()
+    tool = CountingTool()
+    registry.register(tool)
+    handlers = make_handlers(state, ToolExecutor(registry, state_engine=state), tool)
+    calls = 0
+    effects = 0
+
+    def side_effect_then_lose_ack(current_task):
+        nonlocal calls, effects
+        calls += 1
+        effects += 1
+        raise ConnectionError("acknowledgment lost")
+
+    handlers.plan = side_effect_then_lose_ack
+    lifecycle = LifecycleEngine(state, handlers, max_retries=4)
+    try:
+        lifecycle.run(task.task_id)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("ambiguous unmarked callback outcome must propagate")
+
+    assert calls == 1
+    assert effects == 1
+    assert state.get_task(task.task_id).task.status == TaskStatus.FAILED
+    try:
+        lifecycle.run(task.task_id)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("terminal task must not replay the callback")
+    assert calls == 1
+
+
+def test_explicitly_replay_safe_lifecycle_callback_keeps_retry_classification():
+    state = StateEngine()
+    task = Task("marked-callback", "recover safely", "complete", ["verified"])
+    state.create_task(task)
+    registry = ToolRegistry()
+    tool = CountingTool()
+    registry.register(tool)
+    handlers = make_handlers(state, ToolExecutor(registry, state_engine=state), tool)
+    original_plan = handlers.plan
+    calls = 0
+
+    def transient_plan(current_task):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("temporary planning failure")
+        return original_plan(current_task)
+
+    handlers.plan = transient_plan
+    handlers.replay_safe_operations = frozenset({"planning"})
+    result = LifecycleEngine(state, handlers, max_retries=1).run(task.task_id)
+
+    assert result.completion_status == "complete"
+    assert calls == 2
+    assert tool.calls == 1
+
+
+def test_replay_safe_lifecycle_callback_does_not_retry_permanent_error():
+    state = StateEngine()
+    task = Task("marked-permanent-callback", "fail safely", "one attempt", [])
+    state.create_task(task)
+    registry = ToolRegistry()
+    tool = CountingTool()
+    registry.register(tool)
+    handlers = make_handlers(state, ToolExecutor(registry, state_engine=state), tool)
+    calls = 0
+
+    def invalid_plan(current_task):
+        nonlocal calls
+        calls += 1
+        raise ValueError("invalid plan")
+
+    handlers.plan = invalid_plan
+    handlers.replay_safe_operations = frozenset({"planning"})
+    try:
+        LifecycleEngine(state, handlers, max_retries=4).run(task.task_id)
+    except ValueError as exc:
+        assert str(exc) == "invalid plan"
+    else:
+        raise AssertionError("permanent error must propagate")
+
+    assert calls == 1
 
 
 def test_permanent_lifecycle_error_is_not_retried():
@@ -460,3 +607,37 @@ def test_completion_reads_persisted_state_after_restart(tmp_path):
     restarted = StateEngine(SQLiteTaskStore(database))
     assert restarted.get_task(task.task_id).task.status == TaskStatus.COMPLETED
     assert restarted.get_task(task.task_id).result.completion_status == "complete"
+
+
+def test_failed_tool_action_persists_failed_task_result_atomically(tmp_path):
+    database = tmp_path / "failed-tool-result.db"
+    state = StateEngine(SQLiteTaskStore(database))
+    task = Task("failed-tool-result", "run failing tool", "fail", [])
+    state.create_task(task)
+
+    class FailingTool(Tool):
+        name = "counting"
+        description = "Returns a failed tool result"
+        calls = 0
+
+        def execute(self, parameters: dict, context: ToolContext) -> ToolResult:
+            self.calls += 1
+            return ToolResult(success=False, error="expected tool failure")
+
+    registry = ToolRegistry()
+    tool = FailingTool()
+    registry.register(tool)
+    executor = ToolExecutor(registry, PolicyEngine(), state_engine=state)
+    lifecycle = LifecycleEngine(state, make_handlers(state, executor, tool))
+
+    returned = lifecycle.run(task.task_id)
+
+    persisted = StateEngine(SQLiteTaskStore(database)).get_task(task.task_id)
+    assert returned.completion_status == "failed"
+    assert persisted.task.status == TaskStatus.FAILED
+    assert persisted.result == returned
+    assert persisted.result.verification_status == "failed"
+    assert persisted.actions[0].status == ActionStatus.FAILED
+    assert persisted.tool_results[persisted.actions[0].action_id].success is False
+    assert any(event.event_type == "result.recorded" for event in persisted.events)
+    assert tool.calls == 1

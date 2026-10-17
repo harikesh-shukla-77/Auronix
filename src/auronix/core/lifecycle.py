@@ -44,6 +44,9 @@ class LifecycleHandlers:
     verify: Callable[[object], Verification]
     critique: Callable[[object], Critique]
     replan: Callable[[object, Plan, Critique], Plan]
+    # Opt-in assertion by the handler owner. The engine cannot verify that the
+    # callback is pure or that its side effects are idempotent.
+    replay_safe_operations: frozenset[str] = frozenset()
 
 
 class RetryableLifecycleError(Exception):
@@ -615,8 +618,12 @@ class LifecycleEngine:
         return self._build_blocked_result(task_id, action)
 
     def _fail_for_action(self, task_id: str, action: Action) -> Result:
-        self._transition(task_id, TaskStatus.FAILED, f"action {action.action_id} failed; it will not be retried automatically")
-        return self._build_blocked_result(task_id, action)
+        reason = f"action {action.action_id} failed; it will not be retried automatically"
+        self._fail_task(task_id, reason)
+        result = self.state_engine.get_task(task_id).result
+        if result is None:
+            raise RuntimeError("Failed action did not produce a persisted task result.")
+        return result
 
     def _prepare_replan(self, task_id: str) -> bool:
         state = self.state_engine.get_task(task_id)
@@ -709,6 +716,20 @@ class LifecycleEngine:
                 self._finalize_retry_budget_exhaustion(task_id)
                 raise
             except Exception as exc:
+                if operation not in self.handlers.replay_safe_operations:
+                    log_event(
+                        40,
+                        "handler_attempt_not_replayed",
+                        task_id=task_id,
+                        operation=operation,
+                        attempt=attempt,
+                        error_type=type(exc).__name__,
+                    )
+                    self._fail_task(
+                        task_id,
+                        f"{operation} failed with an outcome that is not safe to replay.",
+                    )
+                    raise
                 if not isinstance(exc, (RetryableLifecycleError, TimeoutError, ConnectionError)):
                     self._fail_task(task_id, f"{operation} failed permanently.")
                     raise

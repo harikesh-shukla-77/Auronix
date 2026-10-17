@@ -89,6 +89,10 @@ class ReviewResult:
     issues: tuple[str, ...] = ()
 
 
+class RetryableAgentError(Exception):
+    """Explicitly classified transient failure from an orchestration callback."""
+
+
 class PlannerAgent(Protocol):
     def plan(self, task: Task, *, max_children: int) -> AgentPlan: ...
 
@@ -460,8 +464,12 @@ class AgentOrchestrator:
             verification_status="verified" if verification.passed else "failed",
             completion_status=status,
         )
-        self.state_engine.set_result(result)
-        self.state_engine.transition(task_id, TaskStatus.COMPLETED if verification.passed else TaskStatus.FAILED, "delegated result verified" if verification.passed else "delegated result failed verification")
+        if verification.passed:
+            self.state_engine.complete(result)
+        else:
+            self.state_engine.finalize_failure(
+                result, "delegated result failed verification"
+            )
         return OrchestrationOutcome(status, result, tuple(child_ids))
 
     def _fail_parent(self, task_id: str, child_ids: list[str], reason: str) -> OrchestrationOutcome:
@@ -550,7 +558,7 @@ class AgentOrchestrator:
         return AgentPlan(plan.objective, children, tuple(plan.assumptions))
 
     def _call_bounded(self, callback):
-        """Run pure agent callbacks in daemon threads with finite wait/retries."""
+        """Run a pure callback with bounded waits and classified retries."""
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             consume_retry_attempt("agent_callback")
@@ -574,8 +582,23 @@ class AgentOrchestrator:
                 raise TimeoutError("Agent callback exceeded its configured timeout.")
             if ok:
                 return value
+            if isinstance(value, BaseException) and not isinstance(value, Exception):
+                raise value
             last_error = value if isinstance(value, Exception) else RuntimeError("Agent callback failed.")
-            if isinstance(last_error, TimeoutError):
+            retryable = (
+                not isinstance(last_error, TimeoutError)
+                and (
+                    isinstance(last_error, (RetryableAgentError, ConnectionError))
+                    or getattr(last_error, "retryable", False) is True
+                )
+            )
+            if not retryable:
+                log_event(
+                    40,
+                    "agent_attempt_not_retried",
+                    attempt=attempt + 1,
+                    error_type=type(last_error).__name__,
+                )
                 raise last_error
             log_event(30, "agent_attempt_failed", attempt=attempt + 1, error_type=type(last_error).__name__)
         assert last_error is not None
