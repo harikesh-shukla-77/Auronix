@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -151,6 +152,19 @@ def test_sqlite_failed_task_creation_rolls_back_insert(tmp_path):
         ).fetchone()[0]
     assert row_count == 0
 
+
+def test_corrupt_sqlite_state_json_fails_closed(tmp_path):
+    db_path = tmp_path / "corrupt-state.db"
+    store = SQLiteTaskStore(db_path)
+    store.create(make_task())
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE task_state SET state_json=? WHERE task_id=?",
+            ("{invalid-json", "TASK-SQLITE-001"),
+        )
+
+    with pytest.raises(json.JSONDecodeError):
+        store.get("TASK-SQLITE-001")
 
 
 def test_approval_survives_sqlite_store_recreation(tmp_path):
