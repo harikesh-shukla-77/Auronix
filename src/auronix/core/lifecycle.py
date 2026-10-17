@@ -703,7 +703,10 @@ class LifecycleEngine:
         state = self.state_engine.get_task(task_id)
         if state.task.status not in {TaskStatus.FAILED, TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
             log_event(40, "lifecycle_failure", task_id=task_id, reason_code=reason.split(".")[0][:80])
-            self._transition(task_id, TaskStatus.FAILED, reason)
+            self.state_engine.finalize_failure(
+                self._build_failed_result(task_id),
+                reason,
+            )
 
     def _build_failed_result(self, task_id: str) -> Result:
         return Result(

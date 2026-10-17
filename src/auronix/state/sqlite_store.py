@@ -446,12 +446,39 @@ class SQLiteTaskStore(TaskStore):
             )
         )
 
+        payload = json.dumps(
+            _state_to_dict(state),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         try:
-            self.save(state)
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO task_state (
+                        task_id, status, plan_id, updated_at, state_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task.task_id,
+                        task.status.value,
+                        None,
+                        task.updated_at,
+                        payload,
+                    ),
+                )
         except sqlite3.IntegrityError as exc:
             raise ValueError(
                 f"Task already exists: {task.task_id}"
             ) from exc
+        except sqlite3.Error as exc:
+            log_event(
+                40,
+                "state_persistence_failure",
+                task_id=task.task_id,
+                error_type=type(exc).__name__,
+            )
+            raise
 
         return state
 

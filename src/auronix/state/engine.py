@@ -576,3 +576,85 @@ class StateEngine:
                   from_status=TaskStatus.VERIFYING.value,
                   to_status=TaskStatus.COMPLETED.value)
         return state
+
+    def finalize_failure(self, result: Result, reason: str) -> TaskState:
+        """Persist a failed result and FAILED status in one state save."""
+        state = self.get_task(result.task_id)
+        current_status = state.task.status
+        if current_status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            raise ValueError(
+                f"Cannot finalize a failed result for task in status '{current_status.value}'."
+            )
+        if current_status == TaskStatus.FAILED and state.result is not None:
+            return state
+        if (
+            current_status not in {TaskStatus.FAILED, TaskStatus.PAUSED}
+            and TaskStatus.FAILED not in _ALLOWED_TRANSITIONS[current_status]
+        ):
+            raise ValueError(
+                f"Invalid task transition: {current_status.value} -> failed"
+            )
+
+        snapshot = deepcopy(state)
+        state.result = result
+        if current_status != TaskStatus.FAILED:
+            state.task.status = TaskStatus.FAILED
+            state.task.touch()
+            if current_status == TaskStatus.PAUSED:
+                # Preserve the existing logical transition history while
+                # committing the final state and result atomically.
+                state.events.extend((
+                    StateEvent(
+                        event_type="task.status_changed",
+                        description=(
+                            "paused -> executing: child failure during resumed orchestration"
+                        ),
+                    ),
+                    StateEvent(
+                        event_type="task.status_changed",
+                        description=f"executing -> failed: {reason}",
+                    ),
+                ))
+            else:
+                state.events.append(
+                    StateEvent(
+                        event_type="task.status_changed",
+                        description=f"{current_status.value} -> failed: {reason}",
+                    )
+                )
+        state.events.append(
+            StateEvent(
+                event_type="result.recorded",
+                description=f"Result recorded: {result.result_id}",
+            )
+        )
+        try:
+            self.store.save(state)
+        except Exception:
+            state.__dict__.update(snapshot.__dict__)
+            raise
+
+        if current_status == TaskStatus.PAUSED:
+            log_event(
+                20,
+                "task_transition",
+                task_id=result.task_id,
+                from_status=TaskStatus.PAUSED.value,
+                to_status=TaskStatus.EXECUTING.value,
+            )
+            log_event(
+                20,
+                "task_transition",
+                task_id=result.task_id,
+                from_status=TaskStatus.EXECUTING.value,
+                to_status=TaskStatus.FAILED.value,
+            )
+        elif current_status != TaskStatus.FAILED:
+            log_event(
+                20,
+                "task_transition",
+                task_id=result.task_id,
+                from_status=current_status.value,
+                to_status=TaskStatus.FAILED.value,
+            )
+        return state

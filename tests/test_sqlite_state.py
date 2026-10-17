@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.models.plan import Plan, Step
 from auronix.models.approval import ApprovalStatus
@@ -82,6 +86,71 @@ def test_sqlite_task_exists(tmp_path):
 
     assert store.exists(task.task_id) is True
     assert store.exists("DOES-NOT-EXIST") is False
+
+
+def test_duplicate_task_submission_is_rejected_without_overwriting_state(tmp_path):
+    store = SQLiteTaskStore(tmp_path / "duplicate.db")
+    task = make_task()
+    store.create(task)
+
+    replacement = Task(
+        task_id=task.task_id,
+        goal="different goal",
+        desired_outcome="different outcome",
+        success_criteria=[],
+    )
+    with pytest.raises(ValueError, match="Task already exists"):
+        store.create(replacement)
+
+    restored = store.get(task.task_id)
+    assert restored.task.goal == task.goal
+    assert restored.task.desired_outcome == task.desired_outcome
+
+
+def test_sqlite_failed_state_write_rolls_back_transaction(tmp_path):
+    db_path = tmp_path / "rollback.db"
+    store = SQLiteTaskStore(db_path)
+    engine = StateEngine(store)
+    task = make_task()
+    engine.create_task(task)
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_task_update BEFORE UPDATE ON task_state
+               BEGIN SELECT RAISE(ABORT, 'injected write failure'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected write failure"):
+        engine.transition(task.task_id, TaskStatus.UNDERSTANDING, "injected failure")
+
+    restored = SQLiteTaskStore(db_path).get(task.task_id)
+    assert restored.task.status == TaskStatus.QUEUED
+    assert len(restored.events) == 1
+
+
+def test_sqlite_failed_task_creation_rolls_back_insert(tmp_path):
+    db_path = tmp_path / "create-rollback.db"
+    store = SQLiteTaskStore(db_path)
+    task = make_task()
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_task_insert BEFORE INSERT ON task_state
+               BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END"""
+        )
+
+    with pytest.raises(ValueError, match="Task already exists"):
+        store.create(task)
+
+    reopened_store = SQLiteTaskStore(db_path)
+    assert reopened_store.exists(task.task_id) is False
+    with sqlite3.connect(db_path) as connection:
+        row_count = connection.execute(
+            "SELECT COUNT(*) FROM task_state WHERE task_id = ?",
+            (task.task_id,),
+        ).fetchone()[0]
+    assert row_count == 0
+
 
 
 def test_approval_survives_sqlite_store_recreation(tmp_path):
