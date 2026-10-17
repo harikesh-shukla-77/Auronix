@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from auronix.core.lifecycle import LifecycleEngine, LifecycleHandlers
-from auronix.agents.llm_handlers import GeminiLifecycleHandlersBuilder
+from auronix.agents.llm_handlers import GeminiLifecycleHandlersBuilder, RetryableProviderError
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.models.critique import Critique
@@ -314,7 +314,7 @@ def test_provider_retry_budget_is_not_multiplied_by_lifecycle_retries():
     registry.register(tool)
     handlers = make_handlers(state, ToolExecutor(registry, state_engine=state), tool)
     client = MagicMock()
-    client.models.generate_content.side_effect = TimeoutError("offline transient")
+    client.models.generate_content.side_effect = RetryableProviderError("offline transient")
     builder = GeminiLifecycleHandlersBuilder(client=client, max_retries=2)
     handlers.plan = builder.plan
 

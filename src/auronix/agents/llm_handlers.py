@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import math
 import os
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from contextvars import copy_context
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -27,6 +30,10 @@ from auronix.tools.registry import ToolRegistry
 
 class RetryableProviderError(Exception):
     """Explicitly classified transient provider failure."""
+
+
+class _ProviderCallTimedOut(RuntimeError):
+    """The caller's wait ended while provider completion may still be unknown."""
 
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
@@ -171,15 +178,24 @@ class GeminiLifecycleHandlersBuilder:
         tool_executor: ToolExecutor | None = None,
         max_retries: int = 2,
         model_router: ModelRouter | None = None,
+        timeout_seconds: float = 30.0,
     ) -> None:
         if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= 5:
             raise ValueError("max_retries must be an integer from 0 to 5.")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 300
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise ValueError("timeout_seconds must be greater than 0 and at most 300.")
         self.client = client
         self.model = model
         self.tool_registry = tool_registry
         self.tool_executor = tool_executor
         self.max_retries = max_retries
         self.model_router = model_router
+        self.timeout_seconds = float(timeout_seconds)
         self.latest_results: dict[str, ToolResult] = {}
         self.latest_results_by_task: dict[str, ToolResult] = {}
 
@@ -203,10 +219,36 @@ class GeminiLifecycleHandlersBuilder:
                         # Injected offline clients can exercise handler behavior
                         # without installing the optional Gemini SDK.
                         config = {"response_mime_type": "application/json"}
-                    response = self.client.models.generate_content(
-                        model=self.model, contents=prompt, config=config
+                    def request_provider() -> str:
+                        response = self.client.models.generate_content(
+                            model=self.model, contents=prompt, config=config
+                        )
+                        return response.text if hasattr(response, "text") else str(response)
+
+                    result: Future[str] = Future()
+
+                    def invoke_provider() -> None:
+                        try:
+                            result.set_result(request_provider())
+                        except BaseException as exc:
+                            result.set_exception(exc)
+
+                    worker = threading.Thread(
+                        target=copy_context().run,
+                        args=(invoke_provider,),
+                        daemon=True,
+                        name="auronix-gemini-request",
                     )
-                    text = response.text if hasattr(response, "text") else str(response)
+                    worker.start()
+                    try:
+                        text = result.result(timeout=self.timeout_seconds)
+                    except FutureTimeoutError as exc:
+                        # Even if the SDK call later returns, the controller
+                        # cannot prove the remote request did not complete. The
+                        # daemon worker is not cancelled and may continue running.
+                        raise _ProviderCallTimedOut(
+                            "Gemini request timed out; completion state is unknown."
+                        ) from exc
                     provider_name, model_name = "gemini", self.model
                 cleaned = _clean_json_text(text)
                 parsed = json.loads(cleaned)
@@ -219,6 +261,13 @@ class GeminiLifecycleHandlersBuilder:
             except _RetryBudgetExhausted:
                 raise
             except Exception as exc:
+                if isinstance(exc, _ProviderCallTimedOut):
+                    log_event(40, "provider_request_outcome_unknown", provider="configured",
+                              attempt=attempt + 1, error_type=type(exc).__name__)
+                    raise ValueError(
+                        "Gemini request timed out; provider completion is unknown. "
+                        "The in-flight request may continue; it was not cancelled or retried."
+                    ) from None
                 if not _is_retryable_provider_error(exc):
                     log_event(40, "provider_request_rejected", provider="configured",
                               attempt=attempt + 1, error_type=type(exc).__name__)
@@ -590,6 +639,7 @@ def build_gemini_handlers(
         tool_executor=tool_executor,
         max_retries=max_retries,
         model_router=model_router,
+        timeout_seconds=provider_timeout_seconds,
     )
 
     return LifecycleHandlers(

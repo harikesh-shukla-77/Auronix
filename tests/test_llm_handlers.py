@@ -1,7 +1,12 @@
 import os
+import threading
 from unittest.mock import MagicMock
 import pytest
-from auronix.agents.llm_handlers import GeminiLifecycleHandlersBuilder, build_gemini_handlers
+from auronix.agents.llm_handlers import (
+    GeminiLifecycleHandlersBuilder,
+    RetryableProviderError,
+    build_gemini_handlers,
+)
 from auronix.core.lifecycle import LifecycleEngine
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import ActionStatus
@@ -74,6 +79,24 @@ def test_gemini_retry_limit_must_be_bounded():
         build_gemini_handlers(client=MagicMock(), provider_timeout_seconds=301)
 
 
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [0, -1, float("nan"), float("inf"), float("-inf"), True, 300.1, 10**1000],
+)
+def test_gemini_builder_rejects_invalid_timeout_seconds(timeout_seconds):
+    with pytest.raises(ValueError, match="timeout_seconds must be greater than 0"):
+        GeminiLifecycleHandlersBuilder(client=MagicMock(), timeout_seconds=timeout_seconds)
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.001, 30, 300])
+def test_gemini_builder_accepts_valid_timeout_seconds(timeout_seconds):
+    builder = GeminiLifecycleHandlersBuilder(
+        client=MagicMock(), timeout_seconds=timeout_seconds
+    )
+
+    assert builder.timeout_seconds == float(timeout_seconds)
+
+
 def test_gemini_plan_validation_success():
     mock_client = MagicMock()
     registry = ToolRegistry()
@@ -128,16 +151,19 @@ def test_gemini_plan_rejects_parameters_outside_tool_schema():
         handlers.plan(task)
 
 
-def test_gemini_provider_failure_and_retries():
+def test_gemini_provider_timeout_is_not_retried():
     mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = TimeoutError("API connection error")
+    mock_client.models.generate_content.side_effect = TimeoutError(
+        "FAKE_PROVIDER_CREDENTIAL_SECRET"
+    )
 
-    handlers = build_gemini_handlers(client=mock_client)
+    handlers = build_gemini_handlers(client=mock_client, max_retries=3)
     task = Task(task_id="task-1", goal="Goal", desired_outcome="Outcome", success_criteria=[])
 
-    with pytest.raises(ValueError, match="Failed to obtain valid JSON response from Gemini model"):
+    with pytest.raises(ValueError, match="completion is unknown") as error:
         handlers.plan(task)
-    assert mock_client.models.generate_content.call_count == 3
+    assert "FAKE_PROVIDER_CREDENTIAL_SECRET" not in str(error.value)
+    assert mock_client.models.generate_content.call_count == 1
 
 
 def test_provider_permanent_failure_is_not_retried_and_message_is_sanitized(caplog):
@@ -164,7 +190,7 @@ def test_transient_provider_failure_retries_then_succeeds_without_logging_secret
 
     mock_client = MagicMock()
     mock_client.models.generate_content.side_effect = [
-        TimeoutError("FAKE_EXCEPTION_CREDENTIAL_4a"),
+        RetryableProviderError("FAKE_EXCEPTION_CREDENTIAL_4a"),
         MagicMock(text='{"summary":"ok"}'),
     ]
     handlers = GeminiLifecycleHandlersBuilder(client=mock_client, max_retries=2)
@@ -175,6 +201,30 @@ def test_transient_provider_failure_retries_then_succeeds_without_logging_secret
     assert "FAKE_FULL_PROMPT_5b" not in caplog.text
     assert "FAKE_EXCEPTION_CREDENTIAL_4a" not in caplog.text
     assert "provider_attempt_failed" in caplog.text
+
+
+def test_direct_gemini_controller_timeout_does_not_start_an_overlapping_retry():
+    release = threading.Event()
+    finished = threading.Event()
+    mock_client = MagicMock()
+
+    def slow_provider(**kwargs):
+        release.wait(timeout=1)
+        finished.set()
+        return MagicMock(text='{"summary":"late"}')
+
+    mock_client.models.generate_content.side_effect = slow_provider
+    handlers = GeminiLifecycleHandlersBuilder(
+        client=mock_client, max_retries=3, timeout_seconds=0.01
+    )
+
+    with pytest.raises(ValueError, match="completion is unknown") as error:
+        handlers._call_model("FAKE_PRIVATE_PROMPT")
+    assert "FAKE_PRIVATE_PROMPT" not in str(error.value)
+    assert "not cancelled or retried" in str(error.value)
+    assert mock_client.models.generate_content.call_count == 1
+    release.set()
+    assert finished.wait(timeout=1)
 
 
 @pytest.mark.parametrize("status", [408, 429, 503])
