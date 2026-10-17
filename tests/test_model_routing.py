@@ -117,6 +117,23 @@ def test_ineligible_provider_error_does_not_use_configured_fallback():
     assert fallback.calls == []
 
 
+def test_unclassified_connection_error_does_not_retry_or_use_fallback():
+    primary = MockProvider([ConnectionError("connection outcome unknown")])
+    fallback = MockProvider(["must not run"])
+    router = ModelRouter(
+        (route("primary", "p", retries=2), route("backup", "b")),
+        {"p": primary, "b": fallback},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",)},
+    )
+
+    with pytest.raises(ModelRoutingError):
+        router.complete(ModelRequest("planning", "prompt"))
+
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+
+
 def test_exhausted_execution_budget_does_not_start_fallback():
     primary = MockProvider([RetryableModelError("temporary failure")])
     fallback = MockProvider(["must not run"])

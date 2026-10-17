@@ -9,8 +9,10 @@ routes without invoking providers; `complete()` invokes only that ordered set.
 Routes declare task types, capabilities, enabled state, timeout, and a retry
 limit (0–3). Requests are bounded by a configurable prompt character limit
 (default 100,000); token and cost budgets are not inferred where providers do
-not expose them. A route is retried only for `RetryableModelError`, connection
-errors, or exceptions explicitly marked `retryable=True`. A `TimeoutError` ends
+not expose them. A route is retried only for `RetryableModelError` or exceptions
+explicitly marked `retryable=True`; a generic connection error does not
+establish whether the provider accepted the request and is not retried
+automatically. A `TimeoutError` ends
 the current route's retry loop and fails closed without starting a fallback,
 whether the timeout comes from the router's wait or the provider adapter. A
 provider timeout leaves remote completion uncertain, so another route could

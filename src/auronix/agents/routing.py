@@ -173,7 +173,7 @@ class ModelRouter:
                 except Exception as exc:
                     errors.append(f"{route.name}:{type(exc).__name__}")
                     log_event(30, "model_route_failed", task_type=request.task_type, route=route.name, error_type=type(exc).__name__)
-                    retryable = isinstance(exc, (RetryableModelError, ConnectionError)) or getattr(exc, "retryable", False) is True
+                    retryable = isinstance(exc, RetryableModelError) or getattr(exc, "retryable", False) is True
                     if not retryable:
                         raise ModelRoutingError(
                             "Configured model routes failed: " + ", ".join(errors)
