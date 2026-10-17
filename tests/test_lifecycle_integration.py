@@ -80,15 +80,21 @@ def test_end_to_end_lifecycle_with_filesystem_and_sqlite(tmp_path: Path):
         )
 
     def execute(t: Task, step: Step) -> Action:
-        action = Action(
-            action_id=f"ACT-{step.step_id}",
-            task_id=t.task_id,
-            action_type=ActionType.TOOL_CALL,
-            purpose=step.objective,
-            target=step.suggested_tool,
-            parameters=step.metadata,
-            risk_level="low",
+        state = state_engine.get_task(t.task_id)
+        action_id = f"ACT-{step.step_id}"
+        action = next(
+            (item for item in state.actions if item.action_id == action_id), None
         )
+        if action is None:
+            action = Action(
+                action_id=action_id,
+                task_id=t.task_id,
+                action_type=ActionType.TOOL_CALL,
+                purpose=step.objective,
+                target=step.suggested_tool,
+                parameters=step.metadata,
+                risk_level="low",
+            )
         context = ToolContext(task_id=t.task_id, action_id=action.action_id)
         result = executor.execute(action, context=context)
         latest_tool_result[action.action_id] = result
@@ -132,8 +138,22 @@ def test_end_to_end_lifecycle_with_filesystem_and_sqlite(tmp_path: Path):
         replan=replan,
     )
 
-    lifecycle = LifecycleEngine(state_engine, handlers)
+    lifecycle = LifecycleEngine(
+        state_engine, handlers, approval_engine=approval_engine
+    )
     result = lifecycle.run(task.task_id)
+    assert result.completion_status == "paused"
+    paused_state = state_engine.get_task(task.task_id)
+    assert paused_state.task.status == TaskStatus.PAUSED
+    assert paused_state.actions[0].status == ActionStatus.WAITING_FOR_APPROVAL
+    assert paused_state.actions[0].approval_id is not None
+    approval_engine.approve(
+        paused_state.actions[0].approval_id, approver="test-operator"
+    )
+    approved_state = state_engine.get_task(task.task_id)
+    assert approved_state.actions[0].status == ActionStatus.APPROVED
+    assert approval_engine.is_valid_for_execution(approved_state.actions[0])
+    result = lifecycle.resume(task.task_id)
 
     # Assertions
     assert result.completion_status == "complete"
