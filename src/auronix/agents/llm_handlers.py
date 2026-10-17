@@ -6,7 +6,7 @@ import os
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from contextvars import copy_context
 import threading
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from auronix.core.lifecycle import LifecycleEngine, LifecycleHandlers
@@ -107,10 +107,15 @@ def _validate_plan_dict(
                 )
             if not suggested_tool.strip():
                 raise ValueError(f"Step '{step_id}' suggested_tool cannot be empty.")
-            if tool_registry is None or not tool_registry.exists(suggested_tool):
+            if tool_registry is None:
                 raise ValueError(
                     f"Step '{step_id}' suggests unknown tool '{suggested_tool}'. "
-                    f"Registered tools: {tool_registry.names() if tool_registry else []}"
+                    "Registered tools: []"
+                )
+            if not tool_registry.exists(suggested_tool):
+                raise ValueError(
+                    f"Step '{step_id}' suggests unknown tool '{suggested_tool}'. "
+                    f"Registered tools: {tool_registry.names()}"
                 )
 
         meta = raw_step.get("metadata", {})
@@ -128,7 +133,9 @@ def _validate_plan_dict(
             raise ValueError(f"Step '{step_id}' contains duplicate dependencies.")
 
         if suggested_tool is not None:
-            tool = tool_registry.get(suggested_tool)
+            # Earlier validation in this loop rejects a missing registry.
+            # Mypy does not retain that narrowing across the intervening checks.
+            tool = cast(ToolRegistry, tool_registry).get(suggested_tool)
             if tool.parameter_schema is None:
                 raise ValueError(
                     f"Tool '{suggested_tool}' has no parameter schema and cannot be selected by a model plan."
