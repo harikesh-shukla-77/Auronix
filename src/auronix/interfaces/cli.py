@@ -293,12 +293,12 @@ def _dispatch(args: argparse.Namespace, database: Path) -> int:
 
     if args.command == "memory":
         if args.memory_command == "add":
-            store = SQLiteMemoryStore(
+            memory_store = SQLiteMemoryStore(
                 database,
                 state_engine=StateEngine(SQLiteTaskStore(database)),
             )
             try:
-                entry = store.add(
+                entry = memory_store.add(
                     kind=MemoryKind(args.kind),
                     provenance=MemoryProvenance(args.provenance),
                     title=args.title,
@@ -315,21 +315,21 @@ def _dispatch(args: argparse.Namespace, database: Path) -> int:
             print(f"Stored memory {entry.memory_id} ({entry.kind.value}).")
             return 0
         _require_existing_database(database)
-        store = SQLiteMemoryStore(database)
+        memory_store = SQLiteMemoryStore(database)
         try:
             if args.memory_command == "list":
-                entries = store.list_entries(
+                entries = memory_store.list_entries(
                     kind=MemoryKind(args.kind) if args.kind else None,
                     include_superseded=args.include_superseded,
                     limit=args.limit,
                 )
             elif args.memory_command == "search":
-                entries = store.search(args.query, limit=args.limit)
+                entries = memory_store.search(args.query, limit=args.limit)
             elif args.memory_command == "show":
-                print(_format_memory(store.get(args.memory_id)))
+                print(_format_memory(memory_store.get(args.memory_id)))
                 return 0
             elif args.memory_command == "delete":
-                if not store.delete(args.memory_id):
+                if not memory_store.delete(args.memory_id):
                     raise KeyError(f"Memory entry not found: {args.memory_id}")
                 print(f"Deleted memory {args.memory_id}.")
                 return 0

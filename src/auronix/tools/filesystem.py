@@ -111,24 +111,24 @@ class FilesystemTool(Tool):
                         error=str(exc),
                     )
 
-                content = parameters.get("content")
+                write_content = parameters.get("content")
 
-                if not isinstance(content, str):
+                if not isinstance(write_content, str):
                     return ToolResult(
                         success=False,
                         error="Write operation requires string 'content'.",
                     )
 
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+                path.write_text(write_content, encoding="utf-8")
 
                 return ToolResult(
                     success=True,
-                    output=f"Wrote {len(content)} characters.",
+                    output=f"Wrote {len(write_content)} characters.",
                     evidence=[f"write:{relative_path}"],
                     metadata={
                         "path": relative_path,
-                        "bytes": len(content.encode("utf-8")),
+                        "bytes": len(write_content.encode("utf-8")),
                     },
                 )
 

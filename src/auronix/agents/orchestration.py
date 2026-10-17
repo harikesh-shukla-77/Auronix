@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
 from contextvars import copy_context
+from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 from uuid import uuid4
@@ -26,7 +25,7 @@ from auronix.models.verification import Verification
 from auronix.memory.store import SQLiteMemoryStore
 from auronix.observability import log_event
 from auronix.state.engine import StateEngine
-from auronix.tools.base import ToolContext, ToolResult
+from auronix.tools.base import ToolContext
 from auronix.verification.verifier import Verifier
 
 
@@ -185,8 +184,12 @@ class AgentOrchestrator:
             if state.result is None:
                 raise ValueError(f"Task {task_id} is terminal without a result.")
             terminal_steps = self._ordered_children(self._plan_from_state(state.plan).children) if state.plan else []
-            child_ids = tuple(self._child_task_id(task_id, item.child_id) for item in terminal_steps)
-            return OrchestrationOutcome(state.result.completion_status, state.result, child_ids)
+            terminal_child_ids = tuple(
+                self._child_task_id(task_id, item.child_id) for item in terminal_steps
+            )
+            return OrchestrationOutcome(
+                state.result.completion_status, state.result, terminal_child_ids
+            )
         self._check_depth(task)
         if task.status == TaskStatus.QUEUED:
             self.state_engine.transition(task_id, TaskStatus.UNDERSTANDING, "begin delegated task")
@@ -199,13 +202,15 @@ class AgentOrchestrator:
             try:
                 plan_with_memory = getattr(self.planner, "plan_with_memory", None)
                 if callable(plan_with_memory):
-                    callback = lambda: plan_with_memory(
-                        task,
-                        max_children=self.max_agents,
-                        memory_context=memory_context,
-                    )
+                    def callback():
+                        return plan_with_memory(
+                            task,
+                            max_children=self.max_agents,
+                            memory_context=memory_context,
+                        )
                 else:
-                    callback = lambda: self.planner.plan(task, max_children=self.max_agents)
+                    def callback():
+                        return self.planner.plan(task, max_children=self.max_agents)
                 agent_plan = self._call_bounded(callback)
                 self._validate_plan(agent_plan)
             except Exception as exc:
@@ -400,8 +405,15 @@ class AgentOrchestrator:
 
         def verify(task: Task) -> Verification:
             state = self.state_engine.get_task(child_task_id)
+            plan = state.plan
+            if not isinstance(plan, Plan):
+                raise RuntimeError("Child task has no persisted plan to verify.")
+            if not state.actions:
+                raise RuntimeError("Child task has no action to verify.")
             observations = [item for item in state.observations if item.action_id == state.actions[-1].action_id]
-            return self.verifier.verify(task, state.plan.steps[0], observations)
+            if not plan.steps:
+                raise RuntimeError("Child task plan has no step to verify.")
+            return self.verifier.verify(task, plan.steps[0], observations)
 
         return LifecycleHandlers(
             understand=lambda task: None,
@@ -415,6 +427,10 @@ class AgentOrchestrator:
 
     def _verify_parent(self, task_id: str, plan: AgentPlan, outputs: dict[str, AgentOutput], review: ReviewResult, child_ids: list[str]) -> OrchestrationOutcome:
         state = self.state_engine.get_task(task_id)
+        persisted_plan = state.plan
+        if not isinstance(persisted_plan, Plan):
+            raise RuntimeError("Parent task has no persisted plan to verify.")
+        plan_id = persisted_plan.plan_id
         task = state.task
         if task.status != TaskStatus.OBSERVING:
             self.state_engine.transition(task_id, TaskStatus.OBSERVING, "review child outputs")
@@ -425,7 +441,7 @@ class AgentOrchestrator:
             action_type=ActionType.THINK,
             purpose="aggregate child outcomes and reviewer decision",
             status=ActionStatus.SUCCEEDED,
-            plan_id=state.plan.plan_id,
+            plan_id=plan_id,
             step_id="review",
         )
         current = self.state_engine.get_task(task_id)
@@ -447,7 +463,7 @@ class AgentOrchestrator:
         self.state_engine.record_observation(observation)
         self.state_engine.transition(task_id, TaskStatus.VERIFYING, "verify parent success criteria")
         verification = self.verifier.verify(task, None, [observation])
-        verification.plan_id = state.plan.plan_id
+        verification.plan_id = plan_id
         verification.step_id = "review"
         if not review.approved:
             verification.passed = False

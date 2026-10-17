@@ -81,9 +81,9 @@ class ShellTool(Tool):
                 if path.is_file() and os.access(path, os.X_OK):
                     self._configured_paths[command] = str(path.resolve())
             elif "/" not in command and "\\" not in command:
-                path = shutil.which(command, path=os.defpath)
-                if path is not None:
-                    self._command_paths[command] = str(Path(path).resolve())
+                command_path = shutil.which(command, path=os.defpath)
+                if command_path is not None:
+                    self._command_paths[command] = str(Path(command_path).resolve())
         self.default_timeout = default_timeout
         self.max_timeout = max_timeout
         self.max_output_bytes = max_output_bytes
@@ -278,6 +278,11 @@ class ShellTool(Tool):
                 shell=False,
                 start_new_session=True,
             )
+            assert process.stdout is not None and process.stderr is not None
+            streams = {
+                process.stdout.fileno(): process.stdout,
+                process.stderr.fileno(): process.stderr,
+            }
             output = {"stdout": bytearray(), "stderr": bytearray()}
             truncated = {"stdout": False, "stderr": False}
             deadline = time.monotonic() + timeout
@@ -295,10 +300,11 @@ class ShellTool(Tool):
                         )
                     events = selector.select(min(remaining, 0.1))
                     for key, _ in events:
-                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        stream_file = streams[key.fd]
+                        chunk = os.read(key.fd, 65536)
                         if not chunk:
                             selector.unregister(key.fileobj)
-                            key.fileobj.close()
+                            stream_file.close()
                             continue
                         stream = key.data
                         room = self.max_output_bytes - len(output[stream])

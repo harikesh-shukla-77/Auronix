@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from auronix.models.action import Action, ActionStatus, ActionType
 from auronix.observability import log_event

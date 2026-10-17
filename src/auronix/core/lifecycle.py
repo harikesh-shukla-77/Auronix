@@ -5,13 +5,13 @@ import json
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
-from auronix.models.action import Action, ActionStatus, ActionType
+from auronix.models.action import Action, ActionStatus
 from auronix.models.approval import ApprovalStatus
 from auronix.models.critique import Critique
 from auronix.models.observation import Observation
 from auronix.models.plan import Plan, Step
 from auronix.models.result import Result
-from auronix.models.task import TaskStatus
+from auronix.models.task import Task, TaskStatus
 from auronix.models.verification import Verification
 from auronix.observability import log_event
 from auronix.core.retry_budget import (
@@ -37,13 +37,13 @@ class LifecycleHandlers:
     deterministic code, or combinations of them.
     """
 
-    understand: Callable[[object], None]
-    plan: Callable[[object], Plan]
-    execute: Callable[[object, object], Action]
-    observe: Callable[[object, Action], Observation]
-    verify: Callable[[object], Verification]
-    critique: Callable[[object], Critique]
-    replan: Callable[[object, Plan, Critique], Plan]
+    understand: Callable[[Task], None]
+    plan: Callable[[Task], Plan]
+    execute: Callable[[Task, Step], Action]
+    observe: Callable[[Task, Action], Observation]
+    verify: Callable[[Task], Verification]
+    critique: Callable[[Task], Critique]
+    replan: Callable[[Task, Plan, Critique], Plan]
     # Opt-in assertion by the handler owner. The engine cannot verify that the
     # callback is pure or that its side effects are idempotent.
     replay_safe_operations: frozenset[str] = frozenset()
@@ -235,14 +235,15 @@ class LifecycleEngine:
     def _execute_loop(self, task_id: str) -> Result:
         while True:
             state = self.state_engine.get_task(task_id)
-            if not isinstance(state.plan, Plan):
+            plan = state.plan
+            if not isinstance(plan, Plan):
                 self._fail_task(task_id, "Lifecycle requires an attached plan.")
                 raise RuntimeError("Lifecycle requires an attached plan.")
-            if not state.plan.steps:
+            if not plan.steps:
                 self._fail_task(task_id, "Plan contains no steps.")
                 return self._build_failed_result(task_id)
             try:
-                ordered_steps = self._ordered_steps(state.plan)
+                ordered_steps = self._ordered_steps(plan)
             except ValueError as exc:
                 log_event(40, "lifecycle_plan_rejected", task_id=task_id, error_type=type(exc).__name__)
                 self._fail_task(task_id, "Execution plan dependencies are invalid.")
@@ -254,13 +255,13 @@ class LifecycleEngine:
             for step_index, step in enumerate(ordered_steps):
                 state = self.state_engine.get_task(task_id)
                 verified = self._verification_for_step(
-                    state, state.plan.plan_id, step.step_id
+                    state, plan.plan_id, step.step_id
                 )
                 if step.status == "completed" and verified is not None and verified.passed:
                     continue
                 if step.status == "completed":
                     step.status = "pending"
-                    state = self.state_engine.attach_plan(task_id, state.plan)
+                    state = self.state_engine.attach_plan(task_id, plan)
                 self.state_engine.set_current_step(task_id, step.step_id)
                 state = self.state_engine.get_task(task_id)
                 missing_dependencies = [
@@ -268,7 +269,7 @@ class LifecycleEngine:
                     for dependency in step.dependencies
                     if not (
                         (dependency_verification := self._verification_for_step(
-                            state, state.plan.plan_id, dependency
+                            state, plan.plan_id, dependency
                         ))
                         and dependency_verification.passed
                     )
@@ -280,15 +281,15 @@ class LifecycleEngine:
                     20,
                     "lifecycle_step_ready",
                     task_id=task_id,
-                    plan_id=state.plan.plan_id,
+                    plan_id=plan.plan_id,
                     step_id=step.step_id,
                     dependency_count=len(step.dependencies),
                 )
-                action = self._find_step_action(state, state.plan.plan_id, step)
+                action = self._find_step_action(state, plan.plan_id, step)
 
                 if action is not None:
-                    if action.plan_id != state.plan.plan_id or action.step_id != step.step_id:
-                        action.plan_id = state.plan.plan_id
+                    if action.plan_id != plan.plan_id or action.step_id != step.step_id:
+                        action.plan_id = plan.plan_id
                         action.step_id = step.step_id
                         self.state_engine.update_action(action)
                     if action.status == ActionStatus.WAITING_FOR_APPROVAL:
@@ -302,7 +303,7 @@ class LifecycleEngine:
                             return self._block_terminal_action(task_id, action)
 
                 existing_verification = self._verification_for_step(
-                    state, state.plan.plan_id, step.step_id
+                    state, plan.plan_id, step.step_id
                 )
                 observation = self._observation_for_action(state, action) if action else None
 
@@ -311,7 +312,7 @@ class LifecycleEngine:
                         20,
                         "lifecycle_execution_attempt",
                         task_id=task_id,
-                        plan_id=state.plan.plan_id,
+                        plan_id=plan.plan_id,
                         step_id=step.step_id,
                         attempt=1,
                     )
@@ -333,7 +334,7 @@ class LifecycleEngine:
                     if not isinstance(action, Action) or action.task_id != task_id:
                         self._fail_task(task_id, "Execution handler returned an invalid action.")
                         return self._build_failed_result(task_id)
-                    action.plan_id = action.plan_id or state.plan.plan_id
+                    action.plan_id = action.plan_id or plan.plan_id
                     action.step_id = action.step_id or step.step_id
                     state = self.state_engine.get_task(task_id)
                     if any(a.action_id == action.action_id for a in state.actions):
@@ -366,7 +367,7 @@ class LifecycleEngine:
                 if existing_verification is not None and existing_verification.passed:
                     self.state_engine.record_verification(
                         existing_verification,
-                        plan_id=state.plan.plan_id,
+                        plan_id=plan.plan_id,
                         step_id=step.step_id,
                     )
                     continue
@@ -377,9 +378,9 @@ class LifecycleEngine:
                         TaskStatus.OBSERVING,
                         f"observe action {action.action_id}",
                     )
-                    result = state.tool_results.get(action.action_id)
-                    if result is not None:
-                        observation = self._observation_from_result(action, result)
+                    tool_result = state.tool_results.get(action.action_id)
+                    if tool_result is not None:
+                        observation = self._observation_from_result(action, tool_result)
                     else:
                         observation = self._call_recoverable(
                             task_id,
@@ -418,7 +419,7 @@ class LifecycleEngine:
                     )
                     self.state_engine.record_verification(
                         verification,
-                        plan_id=state.plan.plan_id,
+                        plan_id=plan.plan_id,
                         step_id=step.step_id,
                     )
                 else:
@@ -440,9 +441,9 @@ class LifecycleEngine:
             if replan_requested:
                 continue
 
-            result = self._build_result(task_id)
-            self.state_engine.complete(result)
-            return result
+            completion_result = self._build_result(task_id)
+            self.state_engine.complete(completion_result)
+            return completion_result
 
     @staticmethod
     def _ordered_steps(plan: Plan) -> list[Step]:
@@ -627,11 +628,13 @@ class LifecycleEngine:
 
     def _prepare_replan(self, task_id: str) -> bool:
         state = self.state_engine.get_task(task_id)
-        if state.plan is None:
+        plan = state.plan
+        if not isinstance(plan, Plan):
             self._fail_task(task_id, "Cannot revise a plan that is missing.")
             return False
+        old_plan_id = plan.plan_id
         critique = next(
-            (item for item in reversed(state.critiques) if item.source_plan_id == state.plan.plan_id),
+            (item for item in reversed(state.critiques) if item.source_plan_id == plan.plan_id),
             None,
         )
         revised_plans = {item.source_plan_id for item in state.critiques if item.source_plan_id}
@@ -644,7 +647,7 @@ class LifecycleEngine:
                 "critique",
                 lambda: self.handlers.critique(state.task),
             )
-            critique.source_plan_id = state.plan.plan_id
+            critique.source_plan_id = plan.plan_id
             self.state_engine.record_critique(critique)
             state = self.state_engine.get_task(task_id)
         elif self.max_replans == 0 or len(revised_plans) > self.max_replans:
@@ -652,12 +655,12 @@ class LifecycleEngine:
             return False
         if state.task.status != TaskStatus.REPLANNING:
             self._transition(task_id, TaskStatus.REPLANNING, "create revised plan after failed verification")
-        plan = self._call_recoverable(
+        revised_plan = self._call_recoverable(
             task_id,
             "replanning",
-            lambda: self.handlers.replan(state.task, state.plan, critique),
+            lambda: self.handlers.replan(state.task, plan, critique),
         )
-        return self._attach_revised_plan(task_id, plan, state.plan.plan_id)
+        return self._attach_revised_plan(task_id, revised_plan, old_plan_id)
 
     def _attach_revised_plan(self, task_id: str, plan: Plan, old_plan_id: str) -> bool:
         state = self.state_engine.get_task(task_id)
@@ -685,20 +688,17 @@ class LifecycleEngine:
         payload = {
             "objective": plan.objective,
             "assumptions": plan.assumptions,
-            "steps": sorted(
-                (
-                    {
-                        "step_id": step.step_id,
-                        "objective": step.objective,
-                        "dependencies": sorted(step.dependencies),
-                        "suggested_tool": step.suggested_tool,
-                        "success_criteria": step.success_criteria,
-                        "metadata": step.metadata,
-                    }
-                    for step in plan.steps
-                ),
-                key=lambda item: item["step_id"],
-            ),
+            "steps": [
+                {
+                    "step_id": step.step_id,
+                    "objective": step.objective,
+                    "dependencies": sorted(step.dependencies),
+                    "suggested_tool": step.suggested_tool,
+                    "success_criteria": step.success_criteria,
+                    "metadata": step.metadata,
+                }
+                for step in sorted(plan.steps, key=lambda step: step.step_id)
+            ],
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr)
 

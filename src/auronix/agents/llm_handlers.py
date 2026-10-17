@@ -44,7 +44,7 @@ def _is_retryable_provider_error(exc: Exception) -> bool:
     # remain permanent.
     for attribute in ("status_code", "code"):
         status = getattr(exc, attribute, None)
-        if hasattr(status, "value"):
+        if status is not None and hasattr(status, "value"):
             status = status.value
         if isinstance(status, int) and not isinstance(status, bool):
             if status in {408, 429} or 500 <= status <= 599:
@@ -212,7 +212,7 @@ class GeminiLifecycleHandlersBuilder:
                     provider_name, model_name = reply.provider, reply.model
                 else:
                     try:
-                        from google.genai import types
+                        from google.genai import types  # type: ignore[import-untyped]  # Optional SDK lacks typing metadata.
 
                         config = types.GenerateContentConfig(response_mime_type="application/json")
                     except ImportError:
@@ -616,7 +616,7 @@ def build_gemini_handlers(
                 "to build Gemini lifecycle handlers."
             )
         try:
-            from google import genai
+            from google import genai  # type: ignore[import-untyped]  # Optional SDK lacks typing metadata.
 
             client = genai.Client(
                 api_key=resolved_key,

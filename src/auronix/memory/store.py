@@ -288,7 +288,7 @@ class SQLiteMemoryStore:
         ranked = []
         for entry in entries:
             haystack = f"{entry.title} {entry.content} {' '.join(entry.tags)}".casefold()
-            score = sum(haystack.count(term) for term in terms)
+            score: float = float(sum(haystack.count(term) for term in terms))
             if query.casefold() in haystack:
                 score += 3
             if entry.verified:
@@ -346,6 +346,8 @@ class SQLiteMemoryStore:
     def _validate_verification(self, entry: MemoryEntry) -> None:
         if self.state_engine is None:
             raise ValueError("A StateEngine is required to store verified outcomes.")
+        if entry.source_task_id is None:
+            raise ValueError("Verified memory must reference a source task.")
         try:
             state = self.state_engine.get_task(entry.source_task_id)
         except KeyError as exc:
