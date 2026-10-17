@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from concurrent.futures import Future, TimeoutError
 from contextvars import copy_context
 from dataclasses import dataclass
 import threading
@@ -158,16 +158,25 @@ class ModelRouter:
                         raise ValueError("provider returned an empty or non-text response")
                     return ModelReply(text, route.provider, route.model)
                 except TimeoutError:
-                    errors.append(f"{route.name}:timeout")
+                    errors.append(f"{route.name}:timeout_completion_unknown")
                     log_event(30, "model_route_failed", task_type=request.task_type, route=route.name, error_type="TimeoutError")
-                    break
+                    # Whether the adapter worker is still running or reported a
+                    # timeout itself, remote completion cannot be established.
+                    # Do not retry or fall back and risk duplicating the request.
+                    log_event(30, "model_fallback_blocked_ambiguous_timeout", task_type=request.task_type, route=route.name)
+                    raise ModelRoutingError(
+                        "Configured model routes failed: " + ", ".join(errors)
+                        + "; provider completion is unknown, so no retry or fallback was started."
+                    )
                 except _RetryBudgetExhausted:
                     raise
                 except Exception as exc:
                     errors.append(f"{route.name}:{type(exc).__name__}")
                     log_event(30, "model_route_failed", task_type=request.task_type, route=route.name, error_type=type(exc).__name__)
-                    retryable = isinstance(exc, (RetryableModelError, TimeoutError, ConnectionError)) or getattr(exc, "retryable", False) is True
+                    retryable = isinstance(exc, (RetryableModelError, ConnectionError)) or getattr(exc, "retryable", False) is True
                     if not retryable:
-                        break
+                        raise ModelRoutingError(
+                            "Configured model routes failed: " + ", ".join(errors)
+                        ) from None
         # Error text deliberately excludes provider exception messages/prompts.
         raise ModelRoutingError("Configured model routes failed: " + ", ".join(errors))

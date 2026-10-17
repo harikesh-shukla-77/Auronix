@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 
 import pytest
 
@@ -12,6 +13,7 @@ from auronix.agents.routing import (
     RetryableModelError,
 )
 from auronix.agents.llm_handlers import build_gemini_handlers
+from auronix.core.retry_budget import retry_budget_scope
 
 
 class MockProvider:
@@ -81,6 +83,81 @@ def test_only_explicit_compatible_fallback_is_used_after_bounded_retry():
     assert len(fallback.calls) == 1
 
 
+def test_provider_timeout_does_not_retry_or_fallback_after_ambiguous_completion():
+    primary = MockProvider([TimeoutError("provider timed out")])
+    fallback = MockProvider(["fallback response"])
+    router = ModelRouter(
+        (route("primary", "p", retries=2), route("backup", "b")),
+        {"p": primary, "b": fallback},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",)},
+    )
+
+    with pytest.raises(ModelRoutingError, match="completion is unknown"):
+        router.complete(ModelRequest("planning", "prompt"))
+
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == 0
+
+
+def test_ineligible_provider_error_does_not_use_configured_fallback():
+    primary = MockProvider([RuntimeError("permanent provider rejection")])
+    fallback = MockProvider(["must not run"])
+    router = ModelRouter(
+        (route("primary", "p", retries=2), route("backup", "b")),
+        {"p": primary, "b": fallback},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",)},
+    )
+
+    with pytest.raises(ModelRoutingError):
+        router.complete(ModelRequest("planning", "prompt"))
+
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+
+
+def test_exhausted_execution_budget_does_not_start_fallback():
+    primary = MockProvider([RetryableModelError("temporary failure")])
+    fallback = MockProvider(["must not run"])
+    router = ModelRouter(
+        (route("primary", "p"), route("backup", "b")),
+        {"p": primary, "b": fallback},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",)},
+    )
+
+    with retry_budget_scope(max_attempts=1):
+        with pytest.raises(RuntimeError, match="budget exhausted"):
+            router.complete(ModelRequest("planning", "prompt"))
+
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+
+
+def test_fallback_does_not_recursively_follow_another_fallback():
+    primary = MockProvider([RetryableModelError("primary unavailable")])
+    fallback = MockProvider([RetryableModelError("fallback unavailable")])
+    tertiary = MockProvider(["must not run"])
+    router = ModelRouter(
+        (
+            route("primary", "p"),
+            route("backup", "b"),
+            route("tertiary", "t"),
+        ),
+        {"p": primary, "b": fallback, "t": tertiary},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",), "backup": ("tertiary",)},
+    )
+
+    with pytest.raises(ModelRoutingError):
+        router.complete(ModelRequest("planning", "prompt"))
+
+    assert len(primary.calls) == 1
+    assert len(fallback.calls) == 1
+    assert tertiary.calls == []
+
+
 def test_fallback_is_not_implicit_and_failures_are_redacted():
     provider = MockProvider([RuntimeError("api_key=do-not-log")])
     router = ModelRouter((route("primary"), route("unused", "unconfigured")), {"mock": provider}, primary_by_task={"planning": "primary"})
@@ -102,6 +179,42 @@ def test_timeout_bounds_wait_for_noncompliant_provider():
     with pytest.raises(ModelRoutingError, match="timeout"):
         router.complete(ModelRequest("planning", "prompt"))
     assert time.monotonic() - start < 0.08
+
+
+def test_timed_out_primary_still_running_blocks_explicit_fallback():
+    primary_started = Event()
+    release_primary = Event()
+    primary_finished = Event()
+
+    class SlowPrimary:
+        def complete(self, **kwargs):
+            primary_started.set()
+            try:
+                release_primary.wait(timeout=2)
+                return "late primary response"
+            finally:
+                primary_finished.set()
+
+    class Fallback:
+        def complete(self, **kwargs):
+            pytest.fail("fallback must not overlap an unfinished primary call")
+            return "fallback response"
+
+    router = ModelRouter(
+        (route("primary", "p", timeout=0.02), route("backup", "b")),
+        {"p": SlowPrimary(), "b": Fallback()},
+        primary_by_task={"planning": "primary"},
+        fallbacks={"primary": ("backup",)},
+    )
+
+    try:
+        with pytest.raises(ModelRoutingError, match="completion is unknown"):
+            router.complete(ModelRequest("planning", "prompt"))
+    finally:
+        release_primary.set()
+
+    assert primary_started.is_set()
+    assert primary_finished.wait(timeout=1)
 
 
 def test_noncompliant_timed_out_calls_have_a_global_concurrency_bound():
