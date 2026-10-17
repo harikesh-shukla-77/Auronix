@@ -551,8 +551,7 @@ class GeminiLifecycleHandlersBuilder:
             critique_id=f"crit-{uuid4().hex[:8]}",
             task_id=task.task_id,
             target=task.goal,
-            issues=issues,
-            root_cause=str(root_cause),
+            issues=[*issues, f"Root cause: {root_cause}"],
             recommendation=str(recommendation),
         )
 

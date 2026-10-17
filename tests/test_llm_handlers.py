@@ -298,6 +298,19 @@ def test_gemini_understanding_provider_failure_is_not_swallowed():
         handlers.understand(task)
 
 
+def test_gemini_critique_preserves_root_cause_in_supported_model_field():
+    mock_client = MagicMock()
+    mock_client.models.generate_content.return_value.text = (
+        '{"issues":["step failed"],"root_cause":"missing input",'
+        '"recommendation":"request the input"}'
+    )
+    builder = GeminiLifecycleHandlersBuilder(client=mock_client)
+    critique = builder.critique(Task("critique-task", "goal", "outcome", []))
+
+    assert critique.issues == ["step failed", "Root cause: missing input"]
+    assert critique.recommendation == "request the input"
+
+
 def test_gemini_end_to_end_lifecycle_with_mock_client():
     mock_client = MagicMock()
     registry = ToolRegistry()
