@@ -187,7 +187,9 @@ assert exec_result.success is True
 Auronix includes a pytest suite covering models, state persistence, tool restrictions, policy enforcement, action approvals, verification, and end-to-end lifecycle integration. See [Security Boundaries](docs/SECURITY.md) for shell isolation limitations.
 
 ```bash
-pytest
+python -m pip install -e '.[dev]'
+PYTHONPATH=src python -m pytest -q
+mypy
 ```
 
 ---
