@@ -2,6 +2,9 @@ from pathlib import Path
 
 from auronix.execution.executor import ToolExecutor
 from auronix.models.action import Action, ActionStatus, ActionType
+from auronix.models.task import Task
+from auronix.policy.approval import ApprovalEngine
+from auronix.state.engine import StateEngine
 from auronix.tools.base import ToolContext
 from auronix.tools.filesystem import FilesystemTool
 from auronix.tools.registry import ToolRegistry
@@ -29,7 +32,10 @@ def test_executor_runs_filesystem_tool(tmp_path: Path):
     registry = ToolRegistry()
     registry.register(FilesystemTool(workspace))
 
-    executor = ToolExecutor(registry)
+    state = StateEngine()
+    state.create_task(Task("TASK-FS-EXEC-001", "filesystem test", "write file", []))
+    approvals = ApprovalEngine(state)
+    executor = ToolExecutor(registry, approval_engine=approvals)
 
     action = Action(
         action_id="ACTION-FS-EXEC-001",
@@ -44,12 +50,22 @@ def test_executor_runs_filesystem_tool(tmp_path: Path):
         },
     )
 
-    result = executor.execute(
+    pending = executor.execute(
         action,
         context=ToolContext(
             task_id=action.task_id,
             action_id=action.action_id,
         ),
+    )
+
+    assert pending.success is False
+    assert action.status == ActionStatus.WAITING_FOR_APPROVAL
+    approval_id = pending.metadata["approval_id"]
+    approvals.approve(approval_id, approver="test-operator")
+
+    result = executor.execute(
+        action,
+        context=ToolContext(task_id=action.task_id, action_id=action.action_id),
     )
 
     assert result.success is True

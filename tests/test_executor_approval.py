@@ -183,3 +183,25 @@ def test_executor_cannot_replay_consumed_approval():
     assert first.success is True
     assert second.success is False
     assert spy.invocations == 1
+
+
+def test_executor_enforces_registered_tool_minimum_risk():
+    state_engine, approval_engine, executor, spy, action = setup_executor_test()
+    spy.risk_level = "high"
+    action.risk_level = "low"
+    action.permission_required = False
+
+    result = executor.execute(action)
+
+    assert result.success is False
+    assert result.metadata["policy_outcome"] == "approval_required"
+    assert action.risk_level == "high"
+    assert action.status == ActionStatus.WAITING_FOR_APPROVAL
+    assert spy.invocations == 0
+
+    approval_id = result.metadata["approval_id"]
+    approval_engine.approve(approval_id, approver="admin_user")
+    approved_result = executor.execute(action)
+
+    assert approved_result.success is True
+    assert spy.invocations == 1

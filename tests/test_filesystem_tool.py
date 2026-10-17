@@ -152,3 +152,36 @@ def test_filesystem_exists(tmp_path: Path):
 
     assert result.success is True
     assert result.output is True
+
+
+def test_filesystem_blocks_symlink_escapes_for_read_and_write(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    (workspace / "input").mkdir(parents=True)
+    (workspace / "output").mkdir()
+    (workspace / "scratch").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("outside data", encoding="utf-8")
+    (workspace / "input" / "redirect").symlink_to(outside, target_is_directory=True)
+    (workspace / "output" / "redirect").symlink_to(outside, target_is_directory=True)
+    tool = FilesystemTool(workspace)
+
+    read_result = tool.execute(
+        {"operation": "read", "path": "input/redirect/secret.txt"}, context()
+    )
+    write_result = tool.execute(
+        {
+            "operation": "write",
+            "path": "output/redirect/created.txt",
+            "content": "must remain outside the workspace",
+        },
+        context(),
+    )
+
+    assert read_result.success is False
+    assert "escapes" in read_result.error
+    assert write_result.success is False
+    assert "escapes" in write_result.error
+    assert secret.read_text(encoding="utf-8") == "outside data"
+    assert not (outside / "created.txt").exists()

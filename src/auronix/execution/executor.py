@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from auronix.policy.approval import ApprovalEngine
 
 
+_RISK_LEVELS = {"low": 0, "moderate": 1, "high": 2, "critical": 3}
+
+
 class ToolExecutor:
     """Executes tool-call actions through the registered tool set."""
 
@@ -57,6 +60,18 @@ class ToolExecutor:
             )
 
         tool = self.registry.get(action.target)
+        tool_risk = tool.risk_level.lower().strip()
+        action_risk = action.risk_level.lower().strip()
+        if tool_risk not in _RISK_LEVELS:
+            # Invalid tool declarations must fail closed through PolicyEngine.
+            action.risk_level = tool_risk
+        elif (
+            action_risk in _RISK_LEVELS
+            and _RISK_LEVELS[action_risk] < _RISK_LEVELS[tool_risk]
+        ):
+            # A caller may request a stricter risk level, but cannot lower the
+            # registered tool's minimum approval requirement.
+            action.risk_level = tool_risk
         if context is None:
             context = ToolContext(task_id=action.task_id, action_id=action.action_id)
 
