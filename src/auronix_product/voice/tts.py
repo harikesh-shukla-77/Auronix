@@ -31,8 +31,11 @@ class TTS:
                 if self._voice_obj is None:
                     self._voice_obj = piper.PiperVoice.load(self.voice)
             print("[tts] piper ready")
-        except Exception as e:
-            print(f"[tts] preload failed: {e}")
+        except FileNotFoundError:
+            # Piper voice not downloaded. Silent fallback to macOS say.
+            self._piper_ok = False
+        except Exception:
+            self._piper_ok = False
 
     def speak_async(self, text: str):
         """Non-blocking speak — starts TTS in background thread."""

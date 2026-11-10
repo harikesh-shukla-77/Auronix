@@ -2,9 +2,11 @@
 
 import datetime
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from dateutil import parser as date_parser
 import httpx
 from .undo import UndoManager
 
@@ -79,6 +81,118 @@ def system_status() -> str:
 def save_fact(key: str, value: str, memory) -> str:
     memory.remember_fact(key, value)
     return f"Remembered: {key} = {value}"
+
+
+def _normalize_numbers(text: str) -> str:
+    """Convert word numbers to digits for regex matching."""
+    word_map = {
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "fifteen": "15", "twenty": "20", "thirty": "30", "forty-five": "45",
+        "half an hour": "30 minutes", "half hour": "30 minutes",
+        "an hour": "1 hour", "a minute": "1 minute",
+        "one minute": "1 minute", "two minute": "2 minute",
+    }
+    result = text.lower()
+    for word, digit in sorted(word_map.items(), key=lambda x: -len(x[0])):
+        result = result.replace(f" {word} ", f" {digit} ")
+        result = result.replace(f" {word},", f" {digit},")
+        result = result.replace(f" {word}.", f" {digit}.")
+        if result.startswith(f"{word} "):
+            result = f"{digit} " + result[len(word) + 1:]
+        if result.endswith(f" {word}"):
+            result = result[:-len(word)] + digit
+    return result
+
+
+def _parse_reminder_time(time_str: str, now: datetime.datetime) -> datetime.datetime:
+    """Parse relative ('in 5 minutes', 'in 1 second') or absolute ('at 5pm', 'tomorrow at 10am') times."""
+    lower = time_str.strip().lower()
+    rel_match = re.search(
+        r"(?:^|\bin\s+)(\d+)\s*(sec(?:ond)?s?|min(?:ute)?s?|hours?|hrs?|days?)\b",
+        lower,
+    )
+    if rel_match:
+        amount = int(rel_match.group(1))
+        unit = rel_match.group(2)
+        if unit.startswith("h"):
+            return now + datetime.timedelta(hours=amount)
+        if unit.startswith("m"):
+            return now + datetime.timedelta(minutes=amount)
+        if unit.startswith("d"):
+            return now + datetime.timedelta(days=amount)
+        return now + datetime.timedelta(seconds=amount)
+
+    day_offset = 0
+    cleaned = lower
+    if "tomorrow" in cleaned:
+        day_offset = 1
+        cleaned = re.sub(r"\btomorrow\b", "", cleaned).strip()
+    elif "today" in cleaned:
+        cleaned = re.sub(r"\btoday\b", "", cleaned).strip()
+
+    if not cleaned or cleaned == "at":
+        if day_offset == 0:
+            raise ValueError("Empty time expression")
+        return now + datetime.timedelta(days=day_offset)
+
+    # Zero minutes/seconds so 'at 5pm' resolves to 5:00 PM instead of 5:<current_min> PM
+    base = (now + datetime.timedelta(days=day_offset)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    trigger_dt = date_parser.parse(cleaned, default=base)
+    has_explicit_date = bool(
+        re.search(
+            r"\d{4}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|mon|tue|wed|thu|fri|sat|sun)\b",
+            cleaned,
+        )
+    )
+    if day_offset == 0 and not has_explicit_date and trigger_dt <= now:
+        trigger_dt += datetime.timedelta(days=1)
+    return trigger_dt
+
+
+def add_reminder(task: str, time_str: str, memory) -> str:
+    """Schedule a reminder in memory from a natural-language time string."""
+    try:
+        task = task.strip(" ,.")
+        time_str = _normalize_numbers(time_str)
+        now = datetime.datetime.now()
+        trigger_dt = _parse_reminder_time(time_str, now)
+        memory.add_reminder(task, trigger_dt.isoformat())
+        return f"Reminder set for {trigger_dt.strftime('%I:%M %p')}."
+    except Exception as e:
+        return f"Failed to set reminder: {str(e)}"
+
+
+def cancel_reminders(memory, task_name: str = "") -> str:
+    """Cancel pending reminders matching task_name, or all pending reminders if empty."""
+    if task_name:
+        count = memory.cancel_reminder_by_task(task_name)
+        if count > 0:
+            return f"Cancelled {count} reminder(s) matching '{task_name}'."
+        return f"No pending reminders found for '{task_name}'."
+    count = memory.cancel_all_reminders()
+    if count > 0:
+        return f"Cancelled all {count} pending reminders."
+    return "No pending reminders to cancel."
+
+
+def list_reminders(memory) -> str:
+    """Return a human-readable summary of all pending reminders."""
+    reminders = memory.list_reminders()
+    if not reminders:
+        return "You have no pending reminders."
+
+    lines = [f"You have {len(reminders)} pending reminder(s):"]
+    for r in reminders:
+        try:
+            dt = datetime.datetime.fromisoformat(r["trigger_at"])
+            time_str = dt.strftime("%I:%M %p")
+        except (ValueError, TypeError):
+            time_str = r["trigger_at"]
+        lines.append(f"  - {r['task']} at {time_str}")
+    return "\n".join(lines)
 
 
 # ============ L2 — Reversible actions with undo ============

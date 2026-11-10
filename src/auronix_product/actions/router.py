@@ -8,13 +8,25 @@ from .patterns import (
     _UNDO_PATTERNS, _LIST_UNDO_PATTERNS, _LIST_FILES_PATTERNS,
     _MOVE_PATTERNS, _RENAME_PATTERNS, _TRASH_PATTERNS,
     _EMPTY_TRASH_PATTERNS, _SAVE_NAME_PATTERNS, _RECALL_NAME_PATTERNS,
+    _REMINDER_PATTERNS, _REMIND_IN_PATTERNS, _REMIND_AT_PATTERNS,
+    _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
     open_app, close_app, bring_to_front, close_all_windows, minimize_all,
     list_files, move_file, rename_file, trash_file, empty_trash,
-    undo_action, list_undoable, DEFAULT_CITY,
+    undo_action, list_undoable, add_reminder, list_reminders, cancel_reminders,
+    _normalize_numbers, DEFAULT_CITY,
 )
+
+
+def _duration_timedelta(amount: int, unit: str) -> datetime.timedelta:
+    """Convert an amount and time unit into a timedelta."""
+    if "hour" in unit:
+        return datetime.timedelta(hours=amount)
+    if "sec" in unit:
+        return datetime.timedelta(seconds=amount)
+    return datetime.timedelta(minutes=amount)
 
 
 def _extract_city(text: str) -> str:
@@ -53,8 +65,13 @@ class RoutedCommand:
 
 def quick_route(text: str, memory) -> RoutedCommand | None:
     lower = text.lower().strip().rstrip(".!?, ")
+    normalized_lower = _normalize_numbers(lower)
 
-    # NAME SAVE
+    if "remind" in lower or "reminder" in lower:
+        print(f"[router-debug] reminder input: {lower!r}")
+        print(f"[router-debug] normalized:    {normalized_lower!r}")
+
+    # 1. NAME SAVE / RECALL
     for pat in _SAVE_NAME_PATTERNS:
         m = re.search(pat, lower)
         if m:
@@ -62,7 +79,6 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             memory.remember_fact("name", name)
             return RoutedCommand(f"Nice to meet you, {name}.")
 
-    # NAME RECALL
     for pat in _RECALL_NAME_PATTERNS:
         if re.search(pat, lower):
             name = memory.all_facts().get("name")
@@ -70,11 +86,11 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
                 return RoutedCommand(f"Your name is {name}.")
             return RoutedCommand("I don't know your name yet. Say 'my name is X'.")
 
-    # UNDO LIST (before plain undo)
+    # 2. UNDO LIST (before plain undo)
     if any(re.search(pat, lower) for pat in _LIST_UNDO_PATTERNS):
         return RoutedCommand(list_undoable())
 
-    # UNDO
+    # 3. UNDO
     if any(re.search(pat, lower) for pat in _UNDO_PATTERNS):
         count_match = re.search(r"\b(2|twice|two|do)\b", lower)
         count = 2 if count_match else 1
@@ -82,7 +98,7 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             count = 100
         return RoutedCommand(undo_action(count))
 
-    # EMPTY TRASH (L4)
+    # 4. EMPTY TRASH (L4)
     if any(re.search(pat, lower) for pat in _EMPTY_TRASH_PATTERNS):
         return RoutedCommand(
             "Empty trash? This is permanent. Say yes to confirm.",
@@ -91,13 +107,60 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             confirm_desc="empty trash",
         )
 
-    # TRASH FILE (L2)
-    for pat in _TRASH_PATTERNS:
-        m = re.search(pat, lower)
+    # 5. TRASH FILE (L2) — skip reminder commands like "delete my water reminder"
+    if "remind" not in lower:
+        for pat in _TRASH_PATTERNS:
+            m = re.search(pat, lower)
+            if m:
+                filename = m.group(2).strip()
+                if filename and len(filename) > 2:
+                    return RoutedCommand(trash_file(filename))
+
+    # 6. REMINDERS (deterministic, before time/weather/open)
+    if any(re.search(pat, lower) or re.search(pat, normalized_lower) for pat in _LIST_REMIND_PATTERNS):
+        return RoutedCommand(list_reminders(memory))
+
+    if any(re.search(pat, lower) or re.search(pat, normalized_lower) for pat in _CANCEL_REMIND_PATTERNS):
+        return RoutedCommand(cancel_reminders(memory))
+
+    for pat in _REMIND_IN_PATTERNS:
+        m = re.search(pat, normalized_lower)
         if m:
-            filename = m.group(2).strip()
-            if filename and len(filename) > 2:
-                return RoutedCommand(trash_file(filename))
+            # Detect if pattern is "in X min to Y" or "to Y in X min"
+            if m.group(1).isdigit():
+                amount = int(m.group(1))
+                unit = m.group(2)
+                task = m.group(3).strip(" ,.")
+            else:
+                task = m.group(1).strip(" ,.")
+                amount = int(m.group(2))
+                unit = m.group(3)
+
+            trigger = datetime.datetime.now() + _duration_timedelta(amount, unit)
+            memory.add_reminder(task, trigger.isoformat())
+            return RoutedCommand(f"Reminder set for {trigger.strftime('%I:%M %p')}: {task}")
+
+    # DETERMINISTIC TIMERS ("set a timer in X minutes")
+    for pat in _TIMER_IN_PATTERNS:
+        m = re.search(pat, normalized_lower)
+        if m:
+            amount_str, unit = m.group(1), m.group(2)
+            word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "ten": 10}
+            amount = int(amount_str) if amount_str.isdigit() else word_to_num.get(amount_str, 1)
+            trigger = datetime.datetime.now() + _duration_timedelta(amount, unit)
+            task = "timer"
+            if m.groups() and m.groups()[-1]:
+                raw_task = m.groups()[-1].strip().rstrip(".!?, ")
+                raw_task = re.sub(r"^(a|an|the)\s+", "", raw_task)
+                raw_task = " ".join(raw_task.split())
+                if raw_task:
+                    task = raw_task
+            memory.add_reminder(task, trigger.isoformat())
+            return RoutedCommand(f"Timer set for {trigger.strftime('%I:%M:%S %p')}: {task}")
+
+    # Complex 'at' reminder utterances still go to the LLM so they don't hit open/weather patterns
+    if any(re.search(pat, lower) for pat in (*_REMINDER_PATTERNS, *_REMIND_AT_PATTERNS)) or "remind me" in lower or "reminder" in lower:
+        return None
 
     # TIME
     if any(re.search(pat, lower) for pat in _TIME_PATTERNS):

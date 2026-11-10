@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re as _re
 import subprocess
+import time
 from .. import config
 from ..brain.client import LLM, LLMError
 from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
@@ -13,6 +14,7 @@ from ..voice.tts import TTS
 from ..voice.wake import Hotkey, HOTKEY_DISPLAY
 from ..actions.executor import execute_tool
 from ..actions.router import quick_route, RoutedCommand
+from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
 
 _EMOJI_RE = _re.compile(EMOJI_RE_PATTERN, flags=_re.UNICODE)
@@ -58,6 +60,8 @@ class Agent:
         self.tts = TTS(config.PIPER_VOICE)
         self.llm = LLM()
         self.hotkey = Hotkey()
+        self.scheduler = ReminderScheduler(self.memory, self.tts)
+        self.continuous_mode = False
         self._pending_confirm: callable | None = None
         self._pending_desc: str = ""
 
@@ -122,6 +126,27 @@ class Agent:
         return True
 
     def _process(self, text: str) -> str:
+        lower_clean = text.lower().strip().rstrip(".!?, ")
+
+        # START CONTINUOUS MODE
+        start_phrases = (
+            "start listening", "continuous mode", "always listen",
+            "sunte raho", "chalu karo", "sunna shuru karo", "start continuous",
+        )
+        if any(phrase in lower_clean for phrase in start_phrases):
+            self.continuous_mode = True
+            return "Continuous mode on. I'm listening. Say stop or band karo to exit."
+
+        # STOP CONTINUOUS MODE (exact/prefixed for short words so "Safari band karo" still closes Safari)
+        stop_substrings = ("stop listening", "stop continuous", "stop mode")
+        stop_exact = ("stop", "band", "band karo", "ruko", "bas")
+        if self.continuous_mode and (
+            any(phrase in lower_clean for phrase in stop_substrings)
+            or _re.fullmatch(r"(?:(?:please|auronix)\s+)?(?:" + "|".join(stop_exact) + r")", lower_clean)
+        ):
+            self.continuous_mode = False
+            return "Continuous mode off. Waiting for hotkey."
+
         # Pending confirmation check FIRST
         if self._pending_confirm is not None:
             lower = text.lower().strip().rstrip(".!?, ")
@@ -172,6 +197,24 @@ class Agent:
             return "I couldn't reach the language model."
         return _strip_emoji(response or "Done.")
 
+    def _execute_and_reply(self, user_text: str, text_mode: bool, split_delay: float | None = None) -> None:
+        """Process one user utterance, persist the turn, and speak in voice mode."""
+        print(f"You: {user_text}")
+        response = self._process(user_text)
+        if not response:
+            return
+        print(f"Auronix: {response}")
+        self.memory.add_message("user", user_text)
+        self.memory.add_message("assistant", response)
+        if not text_mode:
+            self.tts.speak_async(response)
+            if split_delay is not None:
+                time.sleep(split_delay)
+            elif self.continuous_mode:
+                # Wait for TTS to finish so mic doesn't hear itself
+                time.sleep(4.0)
+                print("[continuous] Resuming listening...")
+
     def run(self, text_mode: bool = False):
         print("Loading models...")
         if not text_mode:
@@ -186,6 +229,7 @@ class Agent:
         if not text_mode:
             self.tts.speak("Auronix ready")
 
+        self.scheduler.start()
         try:
             while True:
                 if text_mode:
@@ -196,9 +240,12 @@ class Agent:
                     if not text or text.lower() == "exit":
                         break
                 else:
-                    print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}...")
-                    if not self.hotkey.wait():
-                        break
+                    if not self.continuous_mode:
+                        print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}... (or say 'start listening')")
+                        if not self.hotkey.wait():
+                            break
+                    else:
+                        print(f"\n[{current}] Continuous mode active. Listening...")
                     print("Listening...")
                     self._chime()
                     try:
@@ -211,18 +258,21 @@ class Agent:
                     if not text:
                         continue
 
-                print(f"You: {text}")
-                response = self._process(text)
-                if not response:
+                parts = _re.split(r",|\s+and\s+", text, flags=_re.IGNORECASE)
+                parts = [p.strip() for p in parts if len(p.strip()) > 3]
+
+                # Split multiple commands in one breath when continuous mode is active
+                if len(parts) > 1 and self.continuous_mode:
+                    print(f"[continuous] Detected {len(parts)} commands in one breath. Splitting...")
+                    for part in parts:
+                        self._execute_and_reply(part, text_mode, split_delay=3.0)
                     continue
-                print(f"Auronix: {response}")
-                self.memory.add_message("user", text)
-                self.memory.add_message("assistant", response)
-                if not text_mode:
-                    self.tts.speak_async(response)
+
+                self._execute_and_reply(text, text_mode)
 
         except KeyboardInterrupt:
             pass
         finally:
+            self.scheduler.stop()
             print("\nAuronix stopped.")
 

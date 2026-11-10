@@ -88,5 +88,32 @@ TOOLS = [
             "required": ["source"],
         },
     }},
+    {"type": "function", "function": {
+        "name": "add_reminder",
+        "description": "Set a reminder. Use when user says remind me, yaad dila, reminder lagao.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The task to remember"},
+                "time_str": {"type": "string", "description": "When to remind, e.g. 'in 5 minutes', 'at 5pm', 'tomorrow at 10am'"},
+            },
+            "required": ["task", "time_str"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "cancel_reminders",
+        "description": "Cancel pending reminders. Use when user says stop reminder, cancel reminder, reminder hatao.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string", "description": "Optional: specific task to cancel. Leave empty to cancel ALL."}
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_reminders",
+        "description": "List all pending reminders.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
 ]
 

@@ -29,5 +29,15 @@ def execute_tool(name: str, args: dict, memory) -> str:
         return move_file(args["source"], args["dest_folder"])
     if name == "trash_file":
         return trash_file(args["source"])
+    if name == "add_reminder":
+        from .handlers import add_reminder
+        return add_reminder(args["task"], args["time_str"], memory)
+    if name == "cancel_reminders":
+        from .handlers import cancel_reminders
+        task = args.get("task_name") or ""
+        return cancel_reminders(memory, task)
+    if name == "list_reminders":
+        from .handlers import list_reminders
+        return list_reminders(memory)
     return f"Unknown tool: {name}"
 

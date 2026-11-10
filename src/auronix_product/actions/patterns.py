@@ -101,3 +101,35 @@ _RECALL_NAME_PATTERNS = [
     r"\bwho am i\b",
 ]
 
+_REMINDER_PATTERNS = [
+    r"remind me to (.*) at (.*)",
+    r"remind me to (.*) in (.*)",
+    r"remind me in (.*) to (.*)",
+    r"reminder for (.*) at (.*)",
+]
+
+_REMIND_IN_PATTERNS = [
+    r"remind me in (\d+)\s+(second|sec|minute|min|hour)s?\s+to\s+(.+)",
+    r"remind me to (.+)\s+in\s+(\d+)\s+(second|sec|minute|min|hour)s?",
+]
+_REMIND_AT_PATTERNS = [
+    r"remind me at (.+)\s+to\s+(.+)",
+    r"remind me to (.+)\s+at\s+(.+)",
+]
+_LIST_REMIND_PATTERNS = [
+    r"what.{0,10}my reminders",
+    r"list (?:all |my )?reminders",
+    r"show (?:all |my )?reminders",
+    r"reminders batao",
+    r"mere reminders",
+]
+_CANCEL_REMIND_PATTERNS = [
+    r"(cancel|stop|clear|delete).{0,10}reminder",
+    r"reminder (cancel|hatao|band)",
+]
+
+_TIMER_IN_PATTERNS = [
+    r"(?:set (?:a |an )?(?:timer|alarm)|alarm|timer set)\s+(?:for|in)\s+(\d+|one|two|three|four|five|ten)\s+(second|sec|minute|min|hour)s?(?:\s+to\s+(.+))?",
+    r"timer\s+(?:for|in)\s+(\d+|one|two|three|four|five|ten)\s+(second|sec|minute|min|hour)s?(?:\s+to\s+(.+))?",
+]
+
