@@ -1,0 +1,506 @@
+"""Opt-in Linux integration checks; never treat these as microVM acceptance.
+
+Enable only on a disposable, operator-prepared Linux guest with Bubblewrap and
+the dedicated cgroup-v2 resource scope described in docs/PHASE1_GUEST_EXECUTION.md.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+from auronix.tools.guest_execution import (
+    EMPTY_WORKSPACE_MANIFEST,
+    PROTOCOL,
+    GuestExecutionRequest,
+    GuestStatus,
+)
+from auronix.tools.guest_worker import (
+    MAX_CPU_CORES,
+    MAX_FILE_BYTES,
+    MAX_MEMORY_BYTES,
+    MAX_PROCESS_COUNT,
+    MAX_WRITABLE_BYTES,
+    BubblewrapGuestCommandExecutor,
+    _cgroup_observed_limits,
+)
+
+_OPT_IN = os.environ.get("AURONIX_RUN_BWRAP_INTEGRATION") == "1"
+
+
+@pytest.fixture(autouse=True)
+def _acceptance_run_guard(record_property):
+    """Default local runs skip; explicit acceptance runs cannot skip silently."""
+    if not _OPT_IN:
+        pytest.skip("set AURONIX_RUN_BWRAP_INTEGRATION=1 on the prepared Linux target")
+    if not sys.platform.startswith("linux"):
+        pytest.fail("Linux acceptance opt-in was set on a non-Linux host")
+    evidence_xml = os.environ.get("AURONIX_BWRAP_JUNIT_XML")
+    if not evidence_xml:
+        pytest.fail("set AURONIX_BWRAP_JUNIT_XML to a fresh evidence path")
+    if Path(evidence_xml).exists():
+        pytest.fail("acceptance evidence path already exists; choose a fresh path")
+    run_id = os.environ.get("AURONIX_ACCEPTANCE_RUN_ID", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        pytest.fail("set AURONIX_ACCEPTANCE_RUN_ID to a fresh 32-character hex value")
+    run_started_at = os.environ.get("AURONIX_ACCEPTANCE_STARTED_AT", "")
+    try:
+        from datetime import datetime, timezone
+
+        started = datetime.fromisoformat(run_started_at.replace("Z", "+00:00"))
+        if started.tzinfo is None or started.utcoffset() is None:
+            raise ValueError
+    except ValueError:
+        pytest.fail("set AURONIX_ACCEPTANCE_STARTED_AT to a UTC ISO-8601 timestamp")
+    source_revision = os.environ.get("AURONIX_SOURCE_REVISION", "")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_revision):
+        pytest.fail("set AURONIX_SOURCE_REVISION to the tested Git revision")
+    source_manifest_sha256 = os.environ.get("AURONIX_SOURCE_MANIFEST_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256):
+        pytest.fail("set AURONIX_SOURCE_MANIFEST_SHA256 to the source manifest digest")
+    snapshot_manifest_sha256 = os.environ.get("AURONIX_SNAPSHOT_MANIFEST_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", snapshot_manifest_sha256):
+        pytest.fail("set AURONIX_SNAPSHOT_MANIFEST_SHA256 to the snapshot manifest digest")
+    record_property("acceptance_run_id", run_id)
+    record_property("run_started_at", run_started_at)
+    record_property("source_revision", source_revision)
+    record_property("source_manifest_sha256", source_manifest_sha256)
+    record_property("snapshot_manifest_sha256", snapshot_manifest_sha256)
+    record_property("host_platform", sys.platform)
+    record_property("kernel_release", platform.release())
+    record_property("bubblewrap_binary", os.environ.get("AURONIX_BWRAP_BINARY", ""))
+    record_property("configured_cgroup", os.environ.get("AURONIX_GUEST_CGROUP", ""))
+    record_property("configured_seccomp", os.environ.get("AURONIX_GUEST_SECCOMP", ""))
+
+
+def _integration_executor() -> BubblewrapGuestCommandExecutor:
+    binary = os.environ.get("AURONIX_BWRAP_BINARY")
+    cgroup = os.environ.get("AURONIX_GUEST_CGROUP")
+    seccomp = os.environ.get("AURONIX_GUEST_SECCOMP")
+    if not binary or not cgroup:
+        pytest.fail(
+            "set AURONIX_BWRAP_BINARY and AURONIX_GUEST_CGROUP on the Linux target"
+        )
+    if not Path("/usr/bin/python3").is_file():
+        pytest.fail(
+            "Linux target must provide /usr/bin/python3 in its read-only runtime"
+        )
+    mounts: dict[Path, str] = {Path("/usr"): "/usr"}
+    for source, destination in (
+        (Path("/usr/lib"), "/lib"),
+        (Path("/usr/lib64"), "/lib64"),
+    ):
+        if source.is_dir():
+            mounts[source] = destination
+    return BubblewrapGuestCommandExecutor(
+        bwrap_binary=Path(binary),
+        read_only_mounts=mounts,
+        commands={"python3": "/usr/bin/python3"},
+        bootstrap_executable="/usr/bin/python3",
+        resource_cgroup=Path(cgroup),
+        seccomp_filter=Path(seccomp) if seccomp else None,
+    )
+
+
+def _request(*args: str, timeout: float = 5.0) -> GuestExecutionRequest:
+    task_id = "linux-integration"
+    action_id = "action-" + hashlib.sha256("\0".join(args).encode()).hexdigest()[:16]
+    identity = f"{task_id}\0{action_id}"
+    return GuestExecutionRequest(
+        request_id=hashlib.sha256((PROTOCOL + "\0" + identity).encode()).hexdigest(),
+        task_id=task_id,
+        action_id=action_id,
+        approval_id="linux-integration-approval",
+        action_fingerprint="a" * 64,
+        policy_context_digest="b" * 64,
+        workspace_id=hashlib.sha256(
+            ("empty-workspace\0" + identity).encode()
+        ).hexdigest(),
+        workspace_manifest_digest=EMPTY_WORKSPACE_MANIFEST,
+        argv=("python3", *args),
+        cwd=".",
+        timeout_seconds=timeout,
+        max_output_bytes=4096,
+        environment={},
+    )
+
+
+def _execute(executor: BubblewrapGuestCommandExecutor, request: GuestExecutionRequest):
+    with tempfile.TemporaryDirectory(prefix="auronix-bwrap-test-") as raw:
+        workspace = Path(raw) / "workspace"
+        workspace.mkdir(mode=0o700)
+        workspace.chmod(0o700)
+        return executor.execute(request, workspace)
+
+
+def test_linux_namespaces_filesystem_visibility_and_readonly_runtime(tmp_path, record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    sentinel = tmp_path / "host-only-sentinel"
+    sentinel.write_text("never mount this host path", encoding="utf-8")
+    script = (
+        "import json,os,sys\n"
+        "assert not os.path.exists(sys.argv[1])\n"
+        "assert os.path.isdir('/workspace') and os.path.isdir('/tmp')\n"
+        "assert not os.path.exists('/etc/passwd')\n"
+        "os.symlink(sys.argv[1], '/workspace/escape')\n"
+        "try:\n"
+        " open('/workspace/escape','w').write('escape')\n"
+        " raise SystemExit(12)\n"
+        "except OSError:\n"
+        " pass\n"
+        "open('/workspace/ephemeral','w').write('ok')\n"
+        "open('/tmp/ephemeral','w').write('ok')\n"
+        "try:\n"
+        " open('/usr/bin/python3','wb')\n"
+        " raise SystemExit(9)\n"
+        "except OSError:\n"
+        " pass\n"
+        "namespaces={n:[os.stat('/proc/self/ns/'+n).st_dev,"
+        "os.stat('/proc/self/ns/'+n).st_ino] for n in "
+        "('user','mnt','ipc','pid','net','uts')}\n"
+        "mounts=[x.rstrip() for x in open('/proc/self/mountinfo') "
+        "if any(' '+p+' ' in x for p in ('/usr','/proc','/dev','/tmp','/workspace'))]\n"
+        "print(json.dumps({'namespaces':namespaces,'mounts':mounts}))\n"
+    )
+    result = _execute(executor, _request("-c", script, str(sentinel)))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    assert sentinel.read_text(encoding="utf-8") == "never mount this host path"
+    report = json.loads(result.stdout)
+    guest_namespaces = report["namespaces"]
+    record_property("guest_namespace_and_mount_report", json.dumps(report, sort_keys=True))
+    host_namespaces = {}
+    for name in ("user", "mnt", "ipc", "pid", "net", "uts"):
+        host = os.stat(f"/proc/self/ns/{name}")
+        host_namespaces[name] = [host.st_dev, host.st_ino]
+        assert guest_namespaces[name] != [host.st_dev, host.st_ino]
+    record_property("host_namespace_ids", json.dumps(host_namespaces, sort_keys=True))
+
+
+def test_linux_dev_is_empty_readonly_and_has_no_device_nodes(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    code = (
+        "import os\n"
+        "assert os.listdir('/dev') == []\n"
+        "assert not os.path.exists('/dev/null')\n"
+        "m=[x for x in open('/proc/self/mountinfo') if ' /dev ' in x]\n"
+        "assert len(m)==1 and ' - tmpfs ' in m[0] and ' ro,' in m[0]\n"
+        "try:\n"
+        " open('/dev/probe','w')\n"
+        " raise SystemExit(9)\n"
+        "except OSError:\n"
+        " print('empty-readonly-dev '+m[0].rstrip())\n"
+    )
+    result = _execute(executor, _request("-c", code))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    assert result.stdout.startswith("empty-readonly-dev ")
+    record_property("dev_mount_observation", result.stdout.strip())
+
+
+def test_linux_network_namespace_cannot_reach_host_loopback(tmp_path, record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.2)
+    port = listener.getsockname()[1]
+    code = (
+        "import socket,sys; s=socket.socket(); "
+        "\ntry: s.connect(('127.0.0.1',int(sys.argv[1]))); print('connected') "
+        "\nexcept OSError: print('isolated')"
+    )
+    try:
+        result = _execute(executor, _request("-c", code, str(port)))
+        assert result.status is GuestStatus.SUCCEEDED, result.error_code
+        assert result.stdout.strip() == "isolated"
+        record_property("host_loopback_probe", result.stdout.strip())
+        with pytest.raises(TimeoutError):
+            listener.accept()
+    finally:
+        listener.close()
+
+
+def test_linux_timeout_kills_detached_descendant(tmp_path, record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    marker = f"auronix-detached-{time.monotonic_ns()}"
+    child_code = f"import time; time.sleep(30) # {marker}"
+    code = (
+        "import subprocess,sys,time\n"
+        f"child_code = {child_code!r}\n"
+        "p=subprocess.Popen([sys.executable,'-c',child_code],start_new_session=True)\n"
+        f"print({marker!r},flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    result = _execute(executor, _request("-c", code, timeout=0.5))
+    assert result.status is GuestStatus.TIMED_OUT
+    assert result.stdout.strip() == marker
+    deadline = time.monotonic() + 2
+    while _host_proc_contains(marker) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _host_proc_contains(marker)
+    record_property("timeout_detached_descendant", "absent from host /proc after timeout")
+
+
+def test_linux_normal_exit_does_not_leave_detached_descendant(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    marker = f"auronix-normal-exit-{time.monotonic_ns()}"
+    child_code = f"import time; time.sleep(30) # {marker}"
+    code = (
+        "import subprocess,sys\n"
+        "log=open('/tmp/detached.log','wb')\n"
+        f"subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+        "stdin=subprocess.PIPE,stdout=log,stderr=log,start_new_session=True)\n"
+        f"print({marker!r},flush=True)\n"
+    )
+    result = _execute(executor, _request("-c", code, timeout=3))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    deadline = time.monotonic() + 2
+    while _host_proc_contains(marker) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _host_proc_contains(marker)
+    record_property("normal_exit_detached_descendant", "absent from host /proc after normal exit")
+
+
+def _host_proc_contains(marker: str) -> bool:
+    for command_line in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            if marker.encode() in command_line.read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def test_linux_cgroup_resource_contract_is_active(record_property):
+    executor = _integration_executor()
+    assert executor._runtime_ready(), (
+        "target cgroup or Bubblewrap contract is unavailable"
+    )
+    assert executor.resource_cgroup is not None
+    limits = _cgroup_observed_limits(executor.resource_cgroup)
+    assert limits is not None
+    assert limits["memory_bytes"] <= MAX_MEMORY_BYTES
+    assert limits["swap_bytes"] == 0
+    assert limits["processes"] <= MAX_PROCESS_COUNT
+    assert limits["cpu_cores"] <= MAX_CPU_CORES
+    record_property("observed_cgroup_limits", json.dumps(limits, sort_keys=True))
+
+
+def test_linux_output_file_and_workspace_limits_are_enforced(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    output = _execute(executor, _request("-c", "print('x' * 10000)"))
+    assert output.status is GuestStatus.SUCCEEDED
+    assert output.truncated
+    assert len((output.stdout + output.stderr).encode()) <= 4096
+    record_property("output_limit", f"truncated={output.truncated}; bytes<=4096")
+
+    file_code = (
+        "import errno,os\n"
+        "f=open('/workspace/large','wb')\n"
+        "try:\n"
+        " while True: f.write(b'x'*1048576); f.flush()\n"
+        "except OSError as e:\n"
+        " assert e.errno == errno.EFBIG\n"
+        f"assert os.stat('/workspace/large').st_size == {MAX_FILE_BYTES}\n"
+        "print('per-file-limit')\n"
+    )
+    bounded_file = _execute(executor, _request("-c", file_code))
+    assert bounded_file.status is GuestStatus.SUCCEEDED, bounded_file.error_code
+    assert bounded_file.stdout.strip() == "per-file-limit"
+    record_property("per_file_limit", f"observed_size={MAX_FILE_BYTES}; errno=EFBIG")
+
+    workspace_code = (
+        "import errno,os\n"
+        "for i in range(5):\n"
+        " f=open('/workspace/f'+str(i),'wb')\n"
+        " try:\n"
+        "  for _ in range(15): f.write(b'x'*1048576); f.flush()\n"
+        " except OSError as e:\n"
+        "  assert e.errno == errno.ENOSPC\n"
+        "  print('workspace-limit'); break\n"
+        "else: raise SystemExit(10)\n"
+    )
+    bounded_workspace = _execute(executor, _request("-c", workspace_code))
+    assert bounded_workspace.status is GuestStatus.SUCCEEDED, bounded_workspace.error_code
+    assert bounded_workspace.stdout.strip() == "workspace-limit"
+    record_property("workspace_limit", f"aggregate_capacity={MAX_WRITABLE_BYTES}; errno=ENOSPC")
+
+
+def test_linux_address_space_limit_is_inherited_and_enforced(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    code = (
+        "import mmap,resource\n"
+        "lim=resource.getrlimit(resource.RLIMIT_AS)\n"
+        f"assert lim == ({MAX_MEMORY_BYTES},{MAX_MEMORY_BYTES})\n"
+        "try:\n"
+        f" mmap.mmap(-1,{MAX_MEMORY_BYTES + 1})\n"
+        " raise SystemExit(11)\n"
+        "except (OSError,ValueError): print('address-space-limit')\n"
+    )
+    result = _execute(executor, _request("-c", code))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    assert result.stdout.strip() == "address-space-limit"
+    record_property("rlimit_as", f"{MAX_MEMORY_BYTES}; inherited allocation failed")
+
+
+def test_linux_process_count_limit_rejects_excess_children(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    code = (
+        "import subprocess,sys\n"
+        "children = []\n"
+        "try:\n"
+        "    for _ in range(128):\n"
+        "        children.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']))\n"
+        "except OSError:\n"
+        "    pass\n"
+        "finally:\n"
+        "    for child in children: child.kill()\n"
+        "    for child in children: child.wait()\n"
+        "print(len(children))\n"
+    )
+    result = _execute(executor, _request("-c", code, timeout=10))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    assert 0 < int(result.stdout.strip()) < MAX_PROCESS_COUNT
+    record_property("process_count_limit", f"created={result.stdout.strip()}; max={MAX_PROCESS_COUNT}")
+
+
+def test_linux_cpu_burn_is_stopped_by_wall_deadline(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    result = _execute(executor, _request("-c", "while True: pass", timeout=0.5))
+    assert result.status is GuestStatus.TIMED_OUT
+    record_property("wall_timeout", "CPU-bound process returned TIMED_OUT")
+
+
+def test_linux_cgroup_cpu_quota_bounds_aggregate_child_cpu_time(record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    code = (
+        "import resource,subprocess,sys,time\n"
+        "before=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+        "start=time.monotonic()\n"
+        "children=[subprocess.Popen([sys.executable,'-c','while True: pass']) for _ in range(2)]\n"
+        "time.sleep(1.5)\n"
+        "for p in children: p.terminate()\n"
+        "for p in children: p.wait()\n"
+        "after=resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+        "wall=time.monotonic()-start\n"
+        "cpu=(after.ru_utime+after.ru_stime)-(before.ru_utime+before.ru_stime)\n"
+        "assert cpu <= wall*1.35, (cpu,wall)\n"
+        "print('cpu-quota',round(cpu,2),round(wall,2))\n"
+    )
+    result = _execute(executor, _request("-c", code, timeout=5))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    record_property("aggregate_cpu_quota_observation", result.stdout.strip())
+
+
+def test_linux_cancellation_kills_detached_descendant(tmp_path, record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    marker = f"auronix-cancel-{time.monotonic_ns()}"
+    child_code = f"import time; time.sleep(30) # {marker}"
+    code = (
+        "import subprocess,sys,time\n"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],start_new_session=True)\n"
+        f"print({marker!r},flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_execute, executor, _request("-c", code, timeout=10))
+        deadline = time.monotonic() + 3
+        while not _host_proc_contains(marker) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _host_proc_contains(marker), "sandbox child did not start"
+        executor.request_shutdown()
+        result = future.result(timeout=3)
+    assert result.status is GuestStatus.UNKNOWN
+    assert result.error_code == "worker_cancelled"
+    assert not _host_proc_contains(marker)
+    record_property("cancel_detached_descendant", "absent from host /proc after cancellation")
+
+
+def test_linux_bubblewrap_startup_failure_does_not_run_command(tmp_path, record_property):
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail(
+            "target does not satisfy the configured cgroup and Bubblewrap contract"
+        )
+    false_binary = shutil.which("false")
+    if false_binary is None:
+        pytest.fail(
+            "no harmless false executable is available for startup failure check"
+        )
+    failed = BubblewrapGuestCommandExecutor(
+        bwrap_binary=Path(false_binary),
+        read_only_mounts={Path("/usr"): "/usr"},
+        commands={"python3": "/usr/bin/python3"},
+        resource_cgroup=executor.resource_cgroup,
+    )
+    sentinel = tmp_path / "startup-command-ran"
+    script = "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')"
+    result = _execute(failed, _request("-c", script, str(sentinel)))
+    assert result.status is GuestStatus.REJECTED
+    assert result.error_code == "isolation_attestation_failed"
+    assert not sentinel.exists(), "startup failure must not fall back to host execution"
+    record_property("startup_failure", f"{result.error_code}; host sentinel absent")
+
+
+def test_linux_seccomp_filter_active_when_configured(record_property):
+    seccomp = os.environ.get("AURONIX_GUEST_SECCOMP")
+    if not seccomp:
+        pytest.skip("AURONIX_GUEST_SECCOMP not configured on this target")
+    executor = _integration_executor()
+    if not executor._runtime_ready():
+        pytest.fail("target does not satisfy the configured cgroup and Bubblewrap contract")
+    code = (
+        "status = open('/proc/self/status').read()\n"
+        "seccomp = next((l.split(':')[1].strip() for l in status.splitlines() if l.startswith('Seccomp:')), '0')\n"
+        "print('seccomp-mode:' + seccomp)\n"
+    )
+    result = _execute(executor, _request("-c", code))
+    assert result.status is GuestStatus.SUCCEEDED, result.error_code
+    assert result.stdout.strip() == "seccomp-mode:2"
+    record_property("seccomp_mode", "2 (SECCOMP_MODE_FILTER)")
+

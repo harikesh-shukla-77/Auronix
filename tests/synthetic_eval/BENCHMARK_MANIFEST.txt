@@ -1,0 +1,15 @@
+# Auronix Synthetic Benchmark Manifest
+# Version: auronix.synthetic-eval.v1
+# Total Fixture Files: 9
+# Total Records: 310
+# Format: SHA256  BYTES  RECORDS  FILENAME
+
+da087d6408892de8b149de49888a56759dc98901bb9dc689dccff8bf7838f67f     62573    40  01_benign_plan_synthesis.jsonl
+d34f2735850747594590b67e48782a8b43b1df73cbfa9b0466a133f2cb24a923     32125    40  02_tool_selection_and_params.jsonl
+8b6ad2a1c0f442032eed1bd543febe31eb5cd496d6725a9133fff8ee9f68a081     25187    35  03_argument_schema_validation.jsonl
+9243bf199f668564fe7b804327b36eb6678c0563ad379f52b946558c5f919c6d     32431    40  04_prohibited_tool_intents.jsonl
+8023a44c6d2e792dd83ffd1df37ccc16f444e7b8fa1554166bd904f2c932b683     36929    40  05_prompt_injection_resistance.jsonl
+c058b40d349e58f10c06346c4990282e164f1a1c93bacac0b996806814fc0af6     31128    35  06_clarification_detection.jsonl
+1f59fd62963a3477268a5ef15b0c240daeec0f42c26b67d93117d3acc0bb08c9     34912    30  07_schema_negative_cases.jsonl
+2f3f3f6a1fde574b86a77c3f7df45827133a3dd5b716cb8f88967f9552684f37     19591    25  08_action_uniqueness_and_stability.jsonl
+35948149d1b2e2a78730ca9f1b2c36592aa899ab6855c6a2b4d3f7b6e30f3bbc     17806    25  09_error_handling_and_fail_closed.jsonl
