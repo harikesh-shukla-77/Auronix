@@ -11,7 +11,7 @@ from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.memory import Memory
 from ..voice.stt import STT
 from ..voice.tts import TTS
-from ..voice.wake import Hotkey, HOTKEY_DISPLAY
+from ..voice.wake import Hotkey, HOTKEY_DISPLAY, WakeWordDetector
 from ..actions.executor import execute_tool
 from ..actions.router import quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
@@ -60,6 +60,15 @@ class Agent:
         self.tts = TTS(config.PIPER_VOICE)
         self.llm = LLM()
         self.hotkey = Hotkey()
+        self.wake_detector = None
+        try:
+            self.wake_detector = WakeWordDetector(
+                model_path=config.WAKE_ONNX_PATH,
+                config_path=config.WAKE_JSON_PATH,
+                threshold=config.WAKE_THRESHOLD,
+            )
+        except Exception as e:
+            print(f"[wake] WakeWordDetector unavailable ({e}); falling back to {HOTKEY_DISPLAY}.")
         self.scheduler = ReminderScheduler(self.memory, self.tts)
         self.continuous_mode = False
         self._pending_confirm: callable | None = None
@@ -140,12 +149,23 @@ class Agent:
         # STOP CONTINUOUS MODE (exact/prefixed for short words so "Safari band karo" still closes Safari)
         stop_substrings = ("stop listening", "stop continuous", "stop mode")
         stop_exact = ("stop", "band", "band karo", "ruko", "bas")
-        if self.continuous_mode and (
+        is_stop_cmd = (
             any(phrase in lower_clean for phrase in stop_substrings)
-            or _re.fullmatch(r"(?:(?:please|auronix)\s+)?(?:" + "|".join(stop_exact) + r")", lower_clean)
-        ):
-            self.continuous_mode = False
-            return "Continuous mode off. Waiting for hotkey."
+            or bool(
+                _re.fullmatch(
+                    r"(?:(?:okay|ok|hey|please|auronix)[,\s]+)?(?:"
+                    + "|".join(stop_exact)
+                    + r")(?:[,\s]+(?:please|now))?",
+                    lower_clean,
+                )
+            )
+        )
+        if is_stop_cmd:
+            if self.continuous_mode:
+                self.continuous_mode = False
+                return "Continuous mode off. Waiting for wake word."
+            if self._pending_confirm is None:
+                return "Waiting for wake word."
 
         # Pending confirmation check FIRST
         if self._pending_confirm is not None:
@@ -197,7 +217,7 @@ class Agent:
             return "I couldn't reach the language model."
         return _strip_emoji(response or "Done.")
 
-    def _execute_and_reply(self, user_text: str, text_mode: bool, split_delay: float | None = None) -> None:
+    def _execute_and_reply(self, user_text: str, text_mode: bool, is_split: bool = False) -> None:
         """Process one user utterance, persist the turn, and speak in voice mode."""
         print(f"You: {user_text}")
         response = self._process(user_text)
@@ -208,12 +228,12 @@ class Agent:
         self.memory.add_message("assistant", response)
         if not text_mode:
             self.tts.speak_async(response)
-            if split_delay is not None:
-                time.sleep(split_delay)
-            elif self.continuous_mode:
-                # Wait for TTS to finish so mic doesn't hear itself
-                time.sleep(4.0)
-                print("[continuous] Resuming listening...")
+            if self.continuous_mode or is_split:
+                # Wait for TTS to finish based on response length (~0.08s/char + 2.5s buffer)
+                wait_time = min(15.0, (len(response) * 0.08) + 2.5)
+                time.sleep(wait_time)
+                if not is_split:
+                    print("[continuous] Resuming listening...")
 
     def run(self, text_mode: bool = False):
         print("Loading models...")
@@ -225,7 +245,8 @@ class Agent:
                 pass
         self.llm.warmup()
         current = self.llm.model
-        print(f"Auronix ready. Model: {current}. Press {HOTKEY_DISPLAY} to activate.")
+        trigger_hint = "Say 'Auronix'" if self.wake_detector is not None else f"Press {HOTKEY_DISPLAY}"
+        print(f"Auronix ready. Model: {current}. {trigger_hint} to activate.")
         if not text_mode:
             self.tts.speak("Auronix ready")
 
@@ -241,9 +262,14 @@ class Agent:
                         break
                 else:
                     if not self.continuous_mode:
-                        print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}... (or say 'start listening')")
-                        if not self.hotkey.wait():
-                            break
+                        if self.wake_detector is not None:
+                            print("Waiting for wake word 'Auronix'...")
+                            if not self.wake_detector.wait_for_wake():
+                                break
+                        else:
+                            print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}... (or say 'start listening')")
+                            if not self.hotkey.wait():
+                                break
                     else:
                         print(f"\n[{current}] Continuous mode active. Listening...")
                     print("Listening...")
@@ -265,7 +291,7 @@ class Agent:
                 if len(parts) > 1 and self.continuous_mode:
                     print(f"[continuous] Detected {len(parts)} commands in one breath. Splitting...")
                     for part in parts:
-                        self._execute_and_reply(part, text_mode, split_delay=3.0)
+                        self._execute_and_reply(part, text_mode, is_split=True)
                     continue
 
                 self._execute_and_reply(text, text_mode)
@@ -274,5 +300,7 @@ class Agent:
             pass
         finally:
             self.scheduler.stop()
+            if self.wake_detector is not None:
+                self.wake_detector.close()
             print("\nAuronix stopped.")
 

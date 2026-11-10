@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import urllib.parse
 from pathlib import Path
 from dateutil import parser as date_parser
 import httpx
@@ -434,4 +435,48 @@ def undo_action(count: int = 1) -> str:
 
 def list_undoable() -> str:
     return _get_undo().list_recent(5)
+
+
+# ============ Browser automation ============
+
+def open_url(url: str) -> str:
+    """Open a URL in the default browser."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        subprocess.run(["open", url], check=True, timeout=10)
+        return f"Opened {url}."
+    except Exception as e:
+        return f"Failed to open URL: {e}"
+
+
+def search_web(query: str) -> str:
+    """Search Google in the default browser."""
+    encoded = urllib.parse.quote(query.strip())
+    url = f"https://www.google.com/search?q={encoded}"
+    try:
+        subprocess.run(["open", url], check=True, timeout=10)
+        return f"Searching for {query}."
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
+def open_new_tab(browser: str = "Safari") -> str:
+    """Open a new tab in Safari or Chrome."""
+    browser = (browser or "Safari").strip().title()
+    if browser not in ("Safari", "Chrome", "Google Chrome"):
+        return f"Browser {browser} not supported for new tab."
+
+    app_name = "Safari" if browser == "Safari" else "Google Chrome"
+    script = (
+        'tell application "Safari" to make new document'
+        if app_name == "Safari"
+        else 'tell application "Google Chrome" to make new window'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+        return f"Opened new tab in {app_name}."
+    except Exception as e:
+        return f"Failed to open new tab: {e}"
 

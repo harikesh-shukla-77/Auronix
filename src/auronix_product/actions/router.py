@@ -10,13 +10,14 @@ from .patterns import (
     _EMPTY_TRASH_PATTERNS, _SAVE_NAME_PATTERNS, _RECALL_NAME_PATTERNS,
     _REMINDER_PATTERNS, _REMIND_IN_PATTERNS, _REMIND_AT_PATTERNS,
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
+    _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
     open_app, close_app, bring_to_front, close_all_windows, minimize_all,
     list_files, move_file, rename_file, trash_file, empty_trash,
     undo_action, list_undoable, add_reminder, list_reminders, cancel_reminders,
-    _normalize_numbers, DEFAULT_CITY,
+    open_url, search_web, open_new_tab, _normalize_numbers, DEFAULT_CITY,
 )
 
 
@@ -162,6 +163,25 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
     if any(re.search(pat, lower) for pat in (*_REMINDER_PATTERNS, *_REMIND_AT_PATTERNS)) or "remind me" in lower or "reminder" in lower:
         return None
 
+    # BROWSER AUTOMATION
+    for pat in _OPEN_URL_PATTERNS:
+        m = re.search(pat, lower)
+        if m:
+            return RoutedCommand(open_url(m.group(1)))
+
+    for pat in _NEW_TAB_PATTERNS:
+        m = re.search(pat, lower)
+        if m:
+            browser = m.group(1) if m.group(1) else "Safari"
+            return RoutedCommand(open_new_tab(browser))
+
+    for pat in _SEARCH_PATTERNS:
+        m = re.search(pat, lower)
+        if m:
+            query = m.groups()[-1].strip()
+            if query:
+                return RoutedCommand(search_web(query))
+
     # TIME
     if any(re.search(pat, lower) for pat in _TIME_PATTERNS):
         return RoutedCommand(get_current_time())
@@ -245,6 +265,9 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
         if m:
             app = _clean_app_name(m.group(2))
             if app and len(app) > 1:
+                # Ignore generic browser requests
+                if app.lower() in ("in browser", "the browser", "browser", "a browser", "new tab"):
+                    return None
                 return RoutedCommand(open_app(app.title()))
 
     return None

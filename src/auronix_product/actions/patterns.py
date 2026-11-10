@@ -133,3 +133,15 @@ _TIMER_IN_PATTERNS = [
     r"timer\s+(?:for|in)\s+(\d+|one|two|three|four|five|ten)\s+(second|sec|minute|min|hour)s?(?:\s+to\s+(.+))?",
 ]
 
+_OPEN_URL_PATTERNS = [
+    r"open (https?://[^\s]+|[a-zA-Z0-9.-]+\.(?:com|org|net|in|io|co|ai|dev|edu|gov)(?:/[^\s]*)?)",
+    r"go to ([a-zA-Z0-9.-]+\.(?:com|org|net|in|io|co|ai|dev|edu|gov)(?:/[^\s]*)?)",
+]
+_SEARCH_PATTERNS = [
+    r"^search\s+(?:for\s+|google\s+)?(.+)",
+    r"^google\s+(.+)",
+]
+_NEW_TAB_PATTERNS = [
+    r"(?:open\s+(?:a\s+)?)?new tab(?:\s+in\s+(safari|chrome|google chrome))?",
+]
+

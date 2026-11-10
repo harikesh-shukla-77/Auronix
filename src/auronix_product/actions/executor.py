@@ -39,5 +39,14 @@ def execute_tool(name: str, args: dict, memory) -> str:
     if name == "list_reminders":
         from .handlers import list_reminders
         return list_reminders(memory)
+    if name == "open_url":
+        from .handlers import open_url
+        return open_url(args["url"])
+    if name == "search_web":
+        from .handlers import search_web
+        return search_web(args["query"])
+    if name == "open_new_tab":
+        from .handlers import open_new_tab
+        return open_new_tab(args.get("browser", "Safari"))
     return f"Unknown tool: {name}"
 

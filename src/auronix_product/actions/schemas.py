@@ -115,5 +115,31 @@ TOOLS = [
         "description": "List all pending reminders.",
         "parameters": {"type": "object", "properties": {}},
     }},
+    {"type": "function", "function": {
+        "name": "open_url",
+        "description": "Open a website URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "search_web",
+        "description": "Search Google for a query.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "open_new_tab",
+        "description": "Open a new tab in a browser.",
+        "parameters": {
+            "type": "object",
+            "properties": {"browser": {"type": "string"}},
+        },
+    }},
 ]
 

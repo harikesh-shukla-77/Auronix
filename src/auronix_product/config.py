@@ -18,3 +18,12 @@ DB_PATH = AURONIX_HOME / "auronix.db"
 MAX_AUDIO_SECONDS = 10
 SILENCE_RMS_THRESHOLD = 0.012
 SILENCE_CHUNKS_TO_STOP = 25
+
+_PRIMARY_EXPORT_DIR = Path.home() / "Auronix" / "export"
+_NESTED_EXPORT_DIR = Path.home() / "Auronix" / "Auronix" / "export"
+_WAKE_EXPORT_DIR = (
+    _PRIMARY_EXPORT_DIR if (_PRIMARY_EXPORT_DIR / "wake.onnx").exists() else _NESTED_EXPORT_DIR
+)
+WAKE_ONNX_PATH = str(_WAKE_EXPORT_DIR / "wake.onnx")
+WAKE_JSON_PATH = str(_WAKE_EXPORT_DIR / "wake.json")
+WAKE_THRESHOLD = 0.71
