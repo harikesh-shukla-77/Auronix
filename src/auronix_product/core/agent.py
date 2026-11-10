@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 import json
+import os
 import re as _re
 import subprocess
+import sys
 import time
 from .. import config
 from ..brain.client import LLM, LLMError
@@ -201,6 +203,11 @@ class Agent:
 
         # Deterministic router
         routed = quick_route(text, self.memory)
+        if routed is not None and routed.response == "__VISION_READ__":
+            print("[vision] Capturing screen and analyzing...")
+            from ..actions.handlers import read_screen_content
+            return _strip_emoji(read_screen_content(self.llm))
+
         if routed is not None:
             print(f"[quick_route] {routed.response[:80]}")
             if routed.needs_confirm:
@@ -284,23 +291,36 @@ class Agent:
                     if not text:
                         continue
 
-                parts = _re.split(r",|\s+and\s+", text, flags=_re.IGNORECASE)
-                parts = [p.strip() for p in parts if len(p.strip()) > 3]
+                text_lower = text.lower()
+                # Don't split combined browser-search utterances like "open browser and search X"
+                is_combined_search = (
+                    ("search" in text_lower or "khojo" in text_lower)
+                    and any(b in text_lower for b in ("browser", "web", "google", "safari", "chrome"))
+                ) or ("browser" in text_lower and "google" in text_lower)
 
-                # Split multiple commands in one breath when continuous mode is active
-                if len(parts) > 1 and self.continuous_mode:
-                    print(f"[continuous] Detected {len(parts)} commands in one breath. Splitting...")
-                    for part in parts:
-                        self._execute_and_reply(part, text_mode, is_split=True)
-                    continue
+                if not is_combined_search:
+                    parts = _re.split(r",|\s+and\s+", text, flags=_re.IGNORECASE)
+                    parts = [p.strip() for p in parts if len(p.strip()) > 3]
+
+                    # Split multiple commands in one breath when continuous mode is active
+                    if len(parts) > 1 and self.continuous_mode:
+                        print(f"[continuous] Detected {len(parts)} commands in one breath. Splitting...")
+                        for part in parts:
+                            self._execute_and_reply(part, text_mode, is_split=True)
+                        continue
 
                 self._execute_and_reply(text, text_mode)
 
         except KeyboardInterrupt:
             pass
         finally:
-            self.scheduler.stop()
-            if self.wake_detector is not None:
-                self.wake_detector.close()
             print("\nAuronix stopped.")
+            self.scheduler.stop()
+            if hasattr(self, "wake_detector") and self.wake_detector:
+                self.wake_detector.close()
+            # Force clean exit on real CLI shutdown to avoid hanging PyAudio/ONNX thread atexit tracebacks
+            if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
 

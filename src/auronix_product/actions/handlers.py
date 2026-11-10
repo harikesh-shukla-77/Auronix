@@ -2,9 +2,11 @@
 
 import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import urllib.parse
 from pathlib import Path
 from dateutil import parser as date_parser
@@ -479,4 +481,45 @@ def open_new_tab(browser: str = "Safari") -> str:
         return f"Opened new tab in {app_name}."
     except Exception as e:
         return f"Failed to open new tab: {e}"
+
+
+# ============ Screen vision ============
+
+def capture_screen() -> str:
+    """Capture screen to temp PNG file, resized to 1024px max dimension."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        path = f.name
+    subprocess.run(["screencapture", "-x", path], check=True, timeout=10)
+    # Resize to max 1024px — moondream chokes on full Retina screenshots
+    try:
+        subprocess.run(["sips", "-Z", "1024", path], check=True, capture_output=True, timeout=10)
+    except Exception as e:
+        print(f"[vision] resize failed (using original): {e}")
+    return path
+
+
+def analyze_screen(llm, query: str = "Describe what's on this screen briefly.") -> str:
+    """Capture screen, send to vision model, return description."""
+    path = None
+    try:
+        path = capture_screen()
+        return llm.vision_chat(query, path)
+    except Exception as e:
+        return f"Screen analysis failed: {e}"
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+def read_screen_content(llm) -> str:
+    """Specifically read text content from screen (articles, docs, etc.)."""
+    return analyze_screen(
+        llm,
+        "Read the text on this screen clearly. If it's a browser, tell me the "
+        "page title and the main text. If it's a terminal, tell me the last few "
+        "commands and output. Be direct, no fluff.",
+    )
 

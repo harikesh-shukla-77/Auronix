@@ -145,3 +145,13 @@ _NEW_TAB_PATTERNS = [
     r"(?:open\s+(?:a\s+)?)?new tab(?:\s+in\s+(safari|chrome|google chrome))?",
 ]
 
+_VISION_PATTERNS = [
+    r"what.{0,10}(is |'s )?on (my |the )?screen",
+    r"read (my |the )?screen",
+    r"what do you see",
+    r"analyze (my |the )?screen",
+    r"screen (dekho|padho|batao)",
+    r"read (the |all )?(news|articles|results|page)",
+    r"read (it|them) (all |carefully )?(out |aloud )?",
+]
+

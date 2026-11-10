@@ -10,7 +10,7 @@ from .patterns import (
     _EMPTY_TRASH_PATTERNS, _SAVE_NAME_PATTERNS, _RECALL_NAME_PATTERNS,
     _REMINDER_PATTERNS, _REMIND_IN_PATTERNS, _REMIND_AT_PATTERNS,
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
-    _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS,
+    _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
@@ -163,6 +163,11 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
     if any(re.search(pat, lower) for pat in (*_REMINDER_PATTERNS, *_REMIND_AT_PATTERNS)) or "remind me" in lower or "reminder" in lower:
         return None
 
+    # VISION — read what's on screen
+    for pat in _VISION_PATTERNS:
+        if re.search(pat, lower):
+            return RoutedCommand("__VISION_READ__")
+
     # BROWSER AUTOMATION
     for pat in _OPEN_URL_PATTERNS:
         m = re.search(pat, lower)
@@ -174,6 +179,16 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
         if m:
             browser = m.group(1) if m.group(1) else "Safari"
             return RoutedCommand(open_new_tab(browser))
+
+    # Catch "open browser and search X"
+    combined_search = re.search(
+        r"(?:open (?:the )?(?:browser|safari|chrome)|browser mein|browser me).*?(?:search|google|khojo)\s+(?:for\s+)?(.+)",
+        lower,
+    )
+    if combined_search:
+        query = combined_search.group(1).strip()
+        if query:
+            return RoutedCommand(search_web(query))
 
     for pat in _SEARCH_PATTERNS:
         m = re.search(pat, lower)

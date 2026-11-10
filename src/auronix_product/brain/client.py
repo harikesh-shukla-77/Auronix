@@ -1,6 +1,7 @@
 """Ollama client with function calling."""
 
 from __future__ import annotations
+import base64
 import httpx
 from .. import config
 
@@ -34,6 +35,33 @@ class LLM:
             raise LLMError(f"Ollama unreachable: {e}") from e
         except (KeyError, ValueError) as e:
             raise LLMError(f"Bad response: {e}") from e
+
+    def vision_chat(self, prompt: str, image_path: str,
+                    model: str = "minicpm-v") -> str:
+        """Send image + prompt to Ollama vision model."""
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        payload = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": prompt,
+                "images": [img_b64],
+            }],
+            "stream": False,
+            "options": {"num_predict": 250, "temperature": 0.1},
+        }
+        try:
+            r = self._client.post(
+                f"{self.url}/api/chat", json=payload, timeout=180.0
+            )
+            r.raise_for_status()
+            return r.json()["message"]["content"].strip()
+        except httpx.HTTPError as e:
+            raise LLMError(f"Vision model error: {e}") from e
+        except (KeyError, ValueError) as e:
+            raise LLMError(f"Bad vision response: {e}") from e
 
     def warmup(self):
         try:
