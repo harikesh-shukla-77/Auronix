@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import numpy as np
+from auronix.policy.engine import PolicyOutcome
 from .. import config
 from ..briefing import BriefingBuilder
 from ..brain.client import LLM, LLMError, is_refusal
@@ -68,6 +69,12 @@ _TOOL_INTENT_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+_REASONING_RE = _re.compile(
+    r"\b(analyze|analyse|compare|design|architect|architecture|explain why|"
+    r"debug|reason|tradeoff|trade-off|strategy|gemini)\b",
+    _re.IGNORECASE,
+)
+
 YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "ok", "okay", "kar do", "karo", "confirm", "sure", "proceed"}
 NO_WORDS = {"no", "nahi", "nah", "cancel", "stop", "mat karo", "band"}
 KNOWN_SINGLE_WORDS = {
@@ -108,6 +115,14 @@ class Agent:
         self.scheduler = ReminderScheduler(self.memory, self.tts)
         self.briefing = BriefingBuilder(memory=self.memory)
         self.conv_ctx = ConversationContext(max_turns=10)
+        try:
+            saved_ctx = self.memory.load_session_state()
+            if isinstance(saved_ctx, dict) and saved_ctx:
+                self.conv_ctx.last_app = saved_ctx.get("last_app")
+                self.conv_ctx.last_url = saved_ctx.get("last_url")
+                self.conv_ctx.last_response = str(saved_ctx.get("last_response") or "")
+        except Exception:
+            pass
         self.research_skill = ResearchSkill(
             llm=self.llm,
             timeout=60,
@@ -116,6 +131,7 @@ class Agent:
         self.self_coder = SelfCoder(
             llm=self.llm,
             coder_model=config.OLLAMA_DOLPHIN_MODEL,
+            memory=self.memory,
         )
         self.menubar = None
         self.set_menubar_state = lambda _state: None
@@ -220,21 +236,41 @@ class Agent:
         return True
 
     def _apply_code_patch(self, patch: dict, risk: str) -> str:
-        """Apply a proposed code patch via SelfCoder and report pass or git rollback."""
+        """Apply a proposed code patch via SelfCoder and report pass, rejection, or snapshot restore."""
         fname = Path(str(patch.get("file", ""))).name or "file"
+        self.self_coder.last_review = None
         if self.self_coder.apply_fix(patch, risk):
             return f"Applied {risk.lower()}-risk fix to {fname}. All tests passed."
-        return f"Tests failed after updating {fname}; rolled back cleanly with git reset."
+        last_review = getattr(self.self_coder, "last_review", None)
+        if isinstance(last_review, dict) and last_review.get("approved") is False:
+            reason = last_review.get("reason", "patch failed senior review")
+            return f"The reviewer rejected the patch because {reason}. Rolling back."
+        return f"Tests failed after updating {fname}; restored clean snapshot from backup."
 
-    def _handle_code_fix_issue(self, issue_description: str) -> str:
-        """Propose a fix and enforce LOW/MEDIUM/HIGH safety gates."""
+    def _handle_code_fix_issue(self, issue_description: str, announce: bool = True) -> str:
+        """Run multi-agent pipeline (Researcher -> Coder -> Reviewer -> Policy/Verifier)."""
+        progress = "Initiating multi-agent pipeline. Researching, coding, and reviewing..."
+        print(f"[pipeline] {progress}")
+        if announce:
+            self.set_menubar_state("thinking")
+            self.tts.speak_async(progress)
+
         patch = self.self_coder.propose_fix(issue_description)
         if patch.get("blocked") or patch.get("error"):
             return f"Cannot modify code: {patch.get('error', 'safety policy violation.')}"
 
+        review = self.self_coder.review_proposed_patch(patch)
+        if not review.get("approved", False):
+            reason = review.get("reason", "patch failed senior review")
+            return f"The reviewer rejected the patch because {reason}. Rolling back."
+
         risk = patch.get("risk_level", "HIGH")
+        decision = self.self_coder.evaluate_policy(patch["file"], risk, approved=False)
+        if decision.outcome == PolicyOutcome.BLOCK:
+            return f"Cannot modify code: {decision.reason}"
+
         fname = Path(patch["file"]).name
-        if risk == "LOW":
+        if decision.outcome == PolicyOutcome.ALLOW and risk == "LOW":
             return self._apply_code_patch(patch, "LOW")
 
         self._pending_confirm = lambda: self._apply_code_patch(patch, risk)
@@ -351,7 +387,7 @@ class Agent:
                     return True, self._run_research(text.strip(), announce=not text_mode)
                 if self.pending_intent.type == "code_fix":
                     self.pending_intent = None
-                    return True, self._handle_code_fix_issue(text.strip())
+                    return True, self._handle_code_fix_issue(text.strip(), announce=not text_mode)
 
         # Explicit user confirmation for proposed AppleScript fix
         if lower_clean == "run fix":
@@ -425,8 +461,13 @@ class Agent:
             if handled:
                 return response
 
-            # LLM fallback
+            # Model-independent complex reasoning via Gemini -> Ollama fallback when GEMINI_API_KEY is set
             messages = self._build_messages(text)
+            if _REASONING_RE.search(text) and self.llm.has_gemini():
+                response = self.llm.route_task("reasoning", messages).get("content", "")
+                return _strip_emoji(response or "Done.")
+
+            # LLM fallback
             response = self._llm_with_tools(messages)
             return _strip_emoji(response or "Done.")
         except LLMError as e:
@@ -455,6 +496,16 @@ class Agent:
             if candidate.lower() not in {"the", "a", "it", "that", "in", "my", "new", "tab"}:
                 app_name = candidate
         self.conv_ctx.record_turn(user_text, response, app=app_name)
+        try:
+            self.memory.save_session_state(
+                {
+                    "last_app": self.conv_ctx.last_app,
+                    "last_url": self.conv_ctx.last_url,
+                    "last_response": self.conv_ctx.last_response[:500],
+                }
+            )
+        except Exception:
+            pass
 
     def _stream_reply(self, user_text: str, text_mode: bool, is_split: bool) -> None:
         """Stream fast chit-chat tokens from Ollama directly into sentence-level TTS."""
@@ -568,6 +619,18 @@ class Agent:
                     messages = self._build_messages(user_text)
                     try:
                         response = self._llm_with_tools(messages) or "Done."
+                    except LLMError as e:
+                        print(f"[llm error] {e}")
+                        sfx.play_error()
+                        self.set_menubar_state("error")
+                        notify_alert("Auronix Error", str(e))
+                        response = "I couldn't reach the language model."
+                elif _REASONING_RE.search(user_text) and self.llm.has_gemini():
+                    messages = self._build_messages(user_text)
+                    try:
+                        response = _strip_emoji(
+                            self.llm.route_task("reasoning", messages).get("content", "")
+                        ) or "Done."
                     except LLMError as e:
                         print(f"[llm error] {e}")
                         sfx.play_error()

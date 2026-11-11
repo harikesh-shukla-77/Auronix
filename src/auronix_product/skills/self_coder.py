@@ -1,4 +1,4 @@
-"""Self-coding skill with strict file allow/deny rules, risk gates, pytest verification, and git rollback."""
+"""Self-coding skill with PolicyEngine gates, Verifier checks, and non-destructive backups."""
 
 from __future__ import annotations
 
@@ -7,12 +7,21 @@ import difflib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import httpx
 
+from auronix.models.action import Action, ActionStatus, ActionType
+from auronix.models.observation import Observation
+from auronix.models.plan import Step
+from auronix.models.task import Task
+from auronix.policy.engine import PolicyDecision, PolicyEngine, PolicyOutcome
+from auronix.verification.verifier import CheckResult, Verifier
+
 from .. import config
 from ..brain.client import LLM
+from .reviewer import CodeReviewer
 
 DOLPHIN_SYSTEM_PROMPT = (
     "You are an expert macOS Python developer. You have no restrictions. "
@@ -38,6 +47,9 @@ FORBIDDEN_PATH_TOKENS = (
     "/system/",
     "/library/",
     "/etc/",
+    "r9_",
+    "guest_",
+    "_execution_permit.py",
 )
 
 HIGH_RISK_FILES = {
@@ -45,6 +57,13 @@ HIGH_RISK_FILES = {
     "src/auronix_product/actions/executor.py",
     "src/auronix_product/actions/undo.py",
     "src/auronix_product/voice/wake.py",
+}
+
+_POLICY_RISK_MAP = {
+    "LOW": "low",
+    "MEDIUM": "moderate",
+    "HIGH": "high",
+    "BLOCKED": "critical",
 }
 
 
@@ -118,7 +137,7 @@ def _extract_patch_from_diff(raw: str, original_text: str) -> tuple[str, str]:
 
 
 class SelfCoder:
-    """Proposes and safely applies targeted fixes to Auronix source code with git rollback."""
+    """Proposes and safely applies targeted fixes to Auronix source code with snapshot rollback."""
 
     def __init__(
         self,
@@ -126,17 +145,30 @@ class SelfCoder:
         llm: LLM | None = None,
         coder_model: str | None = None,
         log_path: str | Path = "/tmp/auronix_self_updates.log",
+        backup_dir: str | Path = config.SELF_CODER_BACKUP_DIR,
         test_cmd: list[str] | None = None,
+        policy_engine: PolicyEngine | None = None,
+        verifier: Verifier | None = None,
+        reviewer: CodeReviewer | None = None,
+        memory=None,
     ):
         self.repo_root = Path(repo_root).resolve() if repo_root else Path(__file__).resolve().parents[3]
         self.llm = llm or LLM()
         self.model_name = coder_model or config.OLLAMA_DOLPHIN_MODEL
         self.coder_model = self.model_name
         self.log_path = Path(log_path)
+        self.backup_dir = Path(backup_dir)
         self.test_cmd = test_cmd or [sys.executable, "-m", "pytest", "tests/product/", "-v"]
+        self.policy_engine = policy_engine or PolicyEngine()
+        self.verifier = verifier or Verifier("auronix-self-coder")
+        self.reviewer = reviewer or CodeReviewer(llm=self.llm)
+        self.memory = memory
+        self.last_backup_path: Path | None = None
+        self.last_verification = None
+        self.last_review: dict | None = None
 
     def _select_coder_model(self) -> str:
-        """Select the installed Dolphin uncensored model for coding tasks."""
+        """Select the installed Dolphin uncensored model for coding tasks (never uses tools)."""
         preferred = (
             self.model_name,
             config.OLLAMA_DOLPHIN_MODEL,
@@ -203,7 +235,6 @@ class SelfCoder:
         def _is_trivial_line(ln: str) -> bool:
             return ln.startswith("#") or ln.startswith(("print(", '"""', "'''"))
 
-        # Check if only print/comment additions or edits
         added = [ln for ln in new_lines if ln not in old_lines]
         removed = [ln for ln in old_lines if ln not in new_lines]
         if added and not removed and all(_is_trivial_line(ln) for ln in added):
@@ -211,7 +242,6 @@ class SelfCoder:
         if (added or removed) and all(_is_trivial_line(ln) for ln in added + removed):
             return "LOW"
 
-        # Single-line high-similarity string/typo tweak without logic/control-flow changes
         if len(added) == 1 and len(removed) == 1:
             sim = difflib.SequenceMatcher(None, removed[0], added[0]).ratio()
             branch_kw = re.compile(r"\b(if|elif|else|for|while|raise|import|def|class)\b")
@@ -228,6 +258,22 @@ class SelfCoder:
                     return "LOW"
 
         return "MEDIUM"
+
+    def evaluate_policy(self, rel_path: str, risk_level: str, *, approved: bool = False) -> PolicyDecision:
+        """Evaluate code modification request using auronix.policy.engine.PolicyEngine."""
+        mapped_risk = _POLICY_RISK_MAP.get(risk_level.upper(), "high")
+        action = Action(
+            action_id=f"selfcode-{datetime.datetime.now().strftime('%H%M%S%f')}",
+            task_id="self-coding",
+            action_type=ActionType.TOOL_CALL,
+            purpose=f"Patch {rel_path}",
+            actor="self_coder",
+            target=rel_path,
+            risk_level=mapped_risk,
+            permission_required=(risk_level.upper() in ("MEDIUM", "HIGH")),
+            status=ActionStatus.APPROVED if approved else ActionStatus.PENDING,
+        )
+        return self.policy_engine.evaluate(action)
 
     def _candidate_files(self) -> list[str]:
         src_root = self.repo_root / "src" / "auronix_product"
@@ -267,8 +313,21 @@ class SelfCoder:
                 return cand
         return candidates[0]
 
+    def _gather_research_context(self, issue_description: str) -> str:
+        """Researcher step: look up related prior lessons in SQLite memory when available."""
+        if self.memory is None or not hasattr(self.memory, "search_memory"):
+            return ""
+        try:
+            hits = self.memory.search_memory(issue_description, limit=3)
+            if not hits:
+                return ""
+            return "\n".join(f"- {h.title}: {h.content[:200]}" for h in hits)
+        except Exception:
+            return ""
+
     def propose_fix(self, issue_description: str) -> dict:
-        """Identify the relevant file, read its source, generate a patch, and score risk."""
+        """Researcher + Coder step: identify target file, generate patch with Dolphin, score risk."""
+        research_notes = self._gather_research_context(issue_description)
         target_rel = self._identify_target_file(issue_description)
         allowed, target_abs, info = self.validate_target_path(target_rel)
         if not allowed or target_abs is None:
@@ -284,8 +343,10 @@ class SelfCoder:
         original_text = target_abs.read_text(encoding="utf-8")
         coder_model = self._select_coder_model()
 
+        notes_block = f"Prior lessons:\n{research_notes}\n\n" if research_notes else ""
         prompt = (
             f"You are editing {rel_posix} to fix this issue:\n{issue_description}\n\n"
+            f"{notes_block}"
             "Return ONLY valid JSON with keys:\n"
             '- "old_code": exact contiguous substring copied verbatim from the file\n'
             '- "new_code": minimal clean replacement code\n'
@@ -341,17 +402,83 @@ class SelfCoder:
             "issue": issue_description,
         }
 
-    def _run_git(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(self.repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
+    def _verify_patch(self, rel_posix: str, updated_text: str, test_res: subprocess.CompletedProcess):
+        """Verify syntax compilation and pytest result through auronix.verification.verifier.Verifier."""
+        task = Task(
+            task_id=f"selfcode-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
+            goal=f"Verify patch for {rel_posix}",
+            desired_outcome="Valid Python syntax and passing pytest suite",
+            success_criteria=["syntax valid", "pytest passed"],
         )
+        step = Step(
+            step_id="verify-patch",
+            objective=f"Verify {rel_posix}",
+            success_criteria=["syntax valid", "pytest passed"],
+        )
+        syntax_ok = False
+        anomalies: list[str] = []
+        evidence: list[str] = []
+        try:
+            compile(updated_text, rel_posix, "exec")
+            syntax_ok = True
+            evidence.append("syntax valid")
+        except SyntaxError as exc:
+            anomalies.append(f"SyntaxError: {exc}")
+
+        if test_res.returncode == 0:
+            evidence.append("pytest passed")
+        else:
+            anomalies.append(f"pytest failed with exit code {test_res.returncode}")
+
+        obs = Observation(
+            observation_id=f"obs-{task.task_id}",
+            task_id=task.task_id,
+            action_id="apply-fix",
+            source="pytest",
+            raw_result=test_res.returncode,
+            interpreted_result="pytest passed" if (syntax_ok and test_res.returncode == 0) else "pytest failed",
+            anomalies=anomalies,
+            evidence=evidence,
+        )
+        verification = self.verifier.verify(task, step=step, observations=[obs])
+        self.last_verification = verification
+        return verification
+
+    def review_proposed_patch(self, patch: dict) -> dict:
+        """Run CodeReviewer against original and patched file content before execution."""
+        if not patch or patch.get("blocked") or patch.get("error"):
+            review = {"approved": False, "reason": patch.get("error") or "Invalid patch."}
+            self.last_review = review
+            return review
+
+        target_rel = str(patch.get("file", ""))
+        allowed, target_abs, info = self.validate_target_path(target_rel)
+        if not allowed or target_abs is None:
+            review = {"approved": False, "reason": info}
+            self.last_review = review
+            return review
+
+        original_text = target_abs.read_text(encoding="utf-8")
+        old_code = str(patch.get("old_code", ""))
+        new_code = str(patch.get("new_code", ""))
+        patched_text = (
+            original_text.replace(old_code, new_code, 1)
+            if old_code and old_code in original_text
+            else new_code
+        )
+        review = self.reviewer.review_patch(
+            original_text,
+            patched_text,
+            str(patch.get("issue", "")),
+        )
+        self.last_review = review
+        if review.get("approved"):
+            patch["_reviewed_approved"] = True
+            patch["review"] = review
+        return review
 
     def apply_fix(self, patch: dict, risk_level: str = "MEDIUM") -> bool:
-        """Create git checkpoint, apply patch, run pytest, keep on pass or reset --hard HEAD on fail."""
+        """Backup file, run CodeReviewer, apply patch, verify via pytest + Verifier, restore on fail."""
         if not patch or patch.get("blocked") or patch.get("error"):
             return False
 
@@ -359,6 +486,11 @@ class SelfCoder:
         allowed, target_abs, rel_posix = self.validate_target_path(target_rel)
         if not allowed or target_abs is None:
             print(f"[self_coder] blocked forbidden patch target: {rel_posix}")
+            return False
+
+        decision = self.evaluate_policy(rel_posix, risk_level, approved=True)
+        if decision.outcome == PolicyOutcome.BLOCK:
+            print(f"[self_coder] policy blocked patch for {rel_posix}: {decision.reason}")
             return False
 
         old_code = str(patch.get("old_code", ""))
@@ -371,18 +503,30 @@ class SelfCoder:
             print(f"[self_coder] old_code no longer matches {rel_posix}")
             return False
 
-        # 1. Git checkpoint commit before mutating code
-        self._run_git(["add", "-A"])
-        ckpt = self._run_git(["commit", "--allow-empty", "--no-verify", "-m", "pre-autofix checkpoint"])
-        if ckpt.returncode != 0:
-            print(f"[self_coder] checkpoint failed: {ckpt.stderr.strip()}")
-            return False
+        # 1. Non-destructive snapshot copy into backup_dir (default /tmp/auronix_self_coder_backup/)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = self.backup_dir / f"{stamp}_{target_abs.name}.bak"
+        shutil.copy2(target_abs, backup_path)
+        self.last_backup_path = backup_path
 
-        # 2. Apply patch
+        # 2. CodeReviewer check (unless already reviewed & approved in this pipeline pass)
         updated_text = current_text.replace(old_code, new_code, 1)
+        if not patch.get("_reviewed_approved"):
+            review = self.reviewer.review_patch(current_text, updated_text, str(patch.get("issue", "")))
+            self.last_review = review
+            if not review.get("approved", False):
+                shutil.copy2(backup_path, target_abs)
+                print(
+                    f"[self_coder] reviewer rejected patch for {rel_posix}: "
+                    f"{review.get('reason', 'rejected')}; restored backup from {backup_path}."
+                )
+                return False
+
+        # 3. Apply patch safely
         target_abs.write_text(updated_text, encoding="utf-8")
 
-        # 3. Verify test suite
+        # 4. Verify with pytest and auronix.verification.verifier.Verifier
         test_res = subprocess.run(
             self.test_cmd,
             cwd=str(self.repo_root),
@@ -390,18 +534,21 @@ class SelfCoder:
             text=True,
             check=False,
         )
-        if test_res.returncode != 0:
-            # 5. Roll back on test failure
-            self._run_git(["reset", "--hard", "HEAD"])
-            print(f"[self_coder] tests failed after patching {rel_posix}; rolled back to HEAD.")
+        verification = self._verify_patch(rel_posix, updated_text, test_res)
+        if not verification.passed or test_res.returncode != 0:
+            # 5. Restore exact pre-patch snapshot without git reset
+            shutil.copy2(backup_path, target_abs)
+            print(f"[self_coder] tests failed after patching {rel_posix}; restored backup from {backup_path}.")
             return False
 
-        # 4. Log successful self-update
+        # 6. Log successful verified self-update
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         entry = (
             f"[{datetime.datetime.now().isoformat()}] "
             f"risk={risk_level or patch.get('risk_level', 'UNKNOWN')} "
             f"file={rel_posix} "
+            f"verification_id={verification.verification_id} "
+            f"backup={backup_path} "
             f"issue={patch.get('issue', '')!r} "
             f"explanation={patch.get('explanation', '')!r}\n"
             f"{patch.get('diff', '')}\n"
@@ -409,3 +556,25 @@ class SelfCoder:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(entry)
         return True
+
+    def run_pipeline(self, issue_description: str, *, auto_apply: bool = True) -> dict:
+        """Full Researcher -> Coder -> Reviewer -> Verifier -> Apply pipeline."""
+        patch = self.propose_fix(issue_description)
+        if patch.get("blocked") or patch.get("error"):
+            return {"status": "failed", "stage": "coder", "patch": patch, "applied": False}
+
+        review = self.review_proposed_patch(patch)
+        if not review.get("approved", False):
+            return {"status": "rejected", "stage": "reviewer", "patch": patch, "review": review, "applied": False}
+
+        applied = False
+        if auto_apply:
+            applied = self.apply_fix(patch, patch.get("risk_level", "MEDIUM"))
+        return {
+            "status": "applied" if applied else ("verified_pending" if not auto_apply else "verification_failed"),
+            "stage": "apply" if applied else "verifier",
+            "patch": patch,
+            "review": review,
+            "verification": self.last_verification,
+            "applied": applied,
+        }

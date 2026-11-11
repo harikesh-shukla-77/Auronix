@@ -119,15 +119,17 @@ def test_self_coder_propose_apply_pass_and_git_rollback_on_failure(tmp_path):
     ]
 
     update_log = tmp_path / "self_updates.log"
+    backup_dir = tmp_path / "backups"
     coder = SelfCoder(
         repo_root=tmp_path,
         llm=fake_llm,
         coder_model="dolphin-uncensored:latest",
         log_path=update_log,
+        backup_dir=backup_dir,
         test_cmd=[sys.executable, "-m", "pytest", "tests/", "-v"],
     )
 
-    # 1. Valid LOW-risk patch passes tests, persists change, creates checkpoint & logs update
+    # 1. Valid LOW-risk patch passes tests, persists change, saves snapshot backup & logs update (no auto-commit)
     patch = coder.propose_fix("Add debug log in greeting")
     assert coder.model_name == "dolphin-uncensored:latest"
     assert fake_llm.chat.call_args.kwargs["model"] == "dolphin-uncensored:latest"
@@ -135,12 +137,14 @@ def test_self_coder_propose_apply_pass_and_git_rollback_on_failure(tmp_path):
     assert patch["blocked"] is False
     assert patch["file"] == "src/auronix_product/actions/router.py"
     assert patch["risk_level"] == "LOW"
+    coder.reviewer.review_patch = MagicMock(return_value={"approved": True, "reason": "ok"})
     assert coder.apply_fix(patch, patch["risk_level"]) is True
     assert "print('[route] greet')" in target_file.read_text(encoding="utf-8")
-    assert "pre-autofix checkpoint" in _git(tmp_path, "log", "-n", "1", "--pretty=%s").stdout
+    assert coder.last_backup_path is not None and coder.last_backup_path.exists()
+    assert "initial" in _git(tmp_path, "log", "-n", "1", "--pretty=%s").stdout
     assert "router.py" in update_log.read_text(encoding="utf-8")
 
-    # 2. Breaking patch fails dummy pytest assertion -> triggers git reset --hard HEAD rollback
+    # 2. Breaking patch fails dummy pytest assertion -> restores snapshot from backup_dir without git reset
     saved_before_bad = target_file.read_text(encoding="utf-8")
     bad_patch = {
         "blocked": False,
@@ -170,6 +174,7 @@ def test_router_and_agent_code_fix_gates(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_mod, "Memory", lambda: mem)
     agent = agent_mod.Agent()
     agent.llm.chat = MagicMock()
+    agent.self_coder.reviewer.review_patch = MagicMock(return_value={"approved": True, "reason": "ok"})
 
     # LOW risk applies automatically after describing bug
     agent.self_coder.propose_fix = MagicMock(

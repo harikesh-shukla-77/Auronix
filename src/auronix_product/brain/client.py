@@ -5,6 +5,7 @@ import base64
 import json
 import httpx
 from .. import config
+from .providers import AuronixProviderRouter, ModelRoutingError
 
 
 class LLMError(Exception):
@@ -55,6 +56,38 @@ class LLM:
         self.url = url.rstrip("/")
         self.fallback_model = fallback_model
         self._client = httpx.Client(timeout=180.0)
+        self.gateway = AuronixProviderRouter(
+            ollama_url=self.url,
+            http_client=self._client,
+            ollama_fast_model=config.OLLAMA_MODEL,
+            ollama_smart_model=config.OLLAMA_SMART_MODEL,
+            dolphin_model=fallback_model or config.OLLAMA_DOLPHIN_MODEL,
+            gemini_model=config.GEMINI_MODEL,
+        )
+
+    def has_gemini(self) -> bool:
+        return self.gateway.gemini_enabled()
+
+    def route_task(
+        self,
+        task_type: str,
+        messages: list[dict],
+        required_capabilities: frozenset[str] = frozenset(),
+    ) -> dict:
+        """Route a conversation task through ModelRouter (Gemini + Ollama/Dolphin)."""
+        try:
+            reply = self.gateway.complete(
+                task_type=task_type,
+                messages=messages,
+                required_capabilities=required_capabilities,
+            )
+        except ModelRoutingError as exc:
+            raise LLMError(str(exc)) from exc
+        content = reply.text.strip()
+        if (not content or is_refusal(content)) and self.fallback_model and reply.model != self.fallback_model:
+            print(f"[llm] routed {reply.model} refused/empty; falling back to {self.fallback_model}")
+            return self._single_chat(messages, None, self.fallback_model)
+        return {"content": content, "tool_calls": None, "provider": reply.provider, "model": reply.model}
 
     def set_model(self, model: str):
         self.model = model
@@ -90,7 +123,10 @@ class LLM:
         messages: list[dict],
         tools: list[dict] | None = None,
         model: str | None = None,
+        task_type: str | None = None,
     ) -> dict:
+        if task_type is not None and model is None and not tools:
+            return self.route_task(task_type, messages)
         active_model = model or self.model
         can_fallback = bool(self.fallback_model and active_model != self.fallback_model)
         try:
