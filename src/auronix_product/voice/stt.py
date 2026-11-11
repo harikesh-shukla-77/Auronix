@@ -3,6 +3,7 @@
 from __future__ import annotations
 import re
 import tempfile
+import time
 import wave
 import numpy as np
 from .. import config
@@ -50,6 +51,11 @@ SPLIT_RE = re.compile(r"[,\n]")
 
 
 def _filter_repeats(text: str) -> str:
+    words = [w.lower().strip(".,!?।") for w in text.split() if w.strip(".,!?।")]
+    for i in range(len(words) - 3):
+        if words[i] == words[i + 1] == words[i + 2] == words[i + 3]:
+            print(f"[stt] filtered repeat loop: {words[i]}")
+            return ""
     parts = [p.strip().rstrip(".!?") for p in SPLIT_RE.split(text) if p.strip()]
     if not parts:
         return ""
@@ -82,6 +88,13 @@ class STT:
     def __init__(self):
         self.model_name = "mlx-community/whisper-large-v3-mlx"
         self._ready = False
+        self._vad_model = None
+
+    def _get_vad_model(self):
+        if self._vad_model is None:
+            from silero_vad import load_silero_vad
+            self._vad_model = load_silero_vad()
+        return self._vad_model
 
     def preload(self):
         if self._ready:
@@ -99,28 +112,154 @@ class STT:
                 mlx_whisper.transcribe(
                     f.name, path_or_hf_repo=self.model_name, verbose=False
                 )
+            try:
+                self._get_vad_model()
+            except Exception as e:
+                print(f"[stt] silero-vad warmup failed: {e}")
             self._ready = True
             print("[stt] ready")
         except Exception as e:
             print(f"[stt] warmup failed: {e}")
 
-    def record(self, max_seconds: float = 12.0) -> np.ndarray:
+    def record(self, max_seconds: float = 8.0) -> np.ndarray:
+        return self.record_until_silence(max_seconds=max_seconds)
+
+    def _open_stream_safely(self, pa, retries: int = 3, frames_per_buffer: int = 1280):
+        """Open a PyAudio input stream with 3x retry, 0.5s backoff, and device fallback."""
+        import pyaudio
+
+        for attempt in range(retries):
+            kwargs = {
+                "format": pyaudio.paInt16,
+                "channels": 1,
+                "rate": config.SAMPLE_RATE,
+                "input": True,
+                "frames_per_buffer": frames_per_buffer,
+            }
+            if attempt > 0:
+                try:
+                    info = pa.get_default_input_device_info()
+                    if isinstance(info, dict) and isinstance(info.get("index"), int):
+                        kwargs["input_device_index"] = info["index"]
+                except Exception:
+                    pass
+            try:
+                return pa.open(**kwargs)
+            except Exception as e:
+                print(f"[audio] open failed (attempt {attempt + 1}/{retries}): {e}")
+                time.sleep(0.5)
+        try:
+            pa.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("Could not open audio stream after retries")
+
+    def _read_chunk_safely(self, pa, stream, chunk_size: int):
+        """Read one PyAudio chunk, closing/reopening on OSError/IOError up to 3 attempts."""
+        max_read_retries = 3
+        read_retries = 0
+        while stream is not None:
+            try:
+                data = stream.read(chunk_size, exception_on_overflow=False)
+                return data, stream
+            except (OSError, IOError) as e:
+                read_retries += 1
+                print(f"[audio] read failed (attempt {read_retries}/{max_read_retries}): {e}")
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream = None
+                time.sleep(0.2)
+                if read_retries >= max_read_retries:
+                    print("[audio] Entering safe idle mode after repeated read failures")
+                    return None, None
+                try:
+                    stream = self._open_stream_safely(pa, frames_per_buffer=chunk_size)
+                except Exception:
+                    return None, None
+        return None, None
+
+    def record_until_silence(self, max_seconds: float = 8.0, stop_event=None) -> np.ndarray:
+        try:
+            return self._record_silero(max_seconds=max_seconds, stop_event=stop_event)
+        except Exception as e:
+            print(f"[stt] silero-vad unavailable ({e}); using RMS fallback.")
+            return self._record_rms(max_seconds=max_seconds, stop_event=stop_event)
+
+    def _record_silero(self, max_seconds: float = 8.0, stop_event=None) -> np.ndarray:
+        import pyaudio
+        import torch
+        from silero_vad import VADIterator
+
+        model = self._get_vad_model()
+        vad = VADIterator(
+            model,
+            threshold=0.5,
+            sampling_rate=config.SAMPLE_RATE,
+            min_silence_duration_ms=300,
+        )
+        pa = pyaudio.PyAudio()
+        stream = self._open_stream_safely(pa, frames_per_buffer=512)
+        audio_buffer: list[bytes] = []
+        speech_detected = False
+        max_chunks = max(1, int(max_seconds * config.SAMPLE_RATE / 512))
+        try:
+            while len(audio_buffer) < max_chunks:
+                if stop_event is not None and stop_event.is_set():
+                    return np.array([], dtype=np.float32)
+                chunk, stream = self._read_chunk_safely(pa, stream, 512)
+                if chunk is None:
+                    return np.array([], dtype=np.float32)
+                audio_buffer.append(chunk)
+                pcm = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                speech_dict = vad(torch.from_numpy(pcm), return_seconds=False)
+                if speech_dict:
+                    if "start" in speech_dict:
+                        speech_detected = True
+                    if "end" in speech_dict and speech_detected:
+                        break
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+        if not speech_detected:
+            return np.array([], dtype=np.float32)
+        return (
+            np.frombuffer(b"".join(audio_buffer), dtype=np.int16).astype(np.float32)
+            / 32768.0
+        )
+
+    def _record_rms(self, max_seconds: float = 12.0, stop_event=None) -> np.ndarray:
         import pyaudio
         pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=config.SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=1600,
-        )
-        frames = [stream.read(1600, exception_on_overflow=False) for _ in range(5)]
-        total = 5
+        stream = self._open_stream_safely(pa, frames_per_buffer=1600)
+        frames: list[bytes] = []
+        total = 0
         speech_detected = False
         silent = 0
         try:
+            for _ in range(5):
+                if stop_event is not None and stop_event.is_set():
+                    return np.array([], dtype=np.float32)
+                chunk, stream = self._read_chunk_safely(pa, stream, 1600)
+                if chunk is None:
+                    return np.array([], dtype=np.float32)
+                frames.append(chunk)
+                total += 1
             while total < int(max_seconds * 10):
-                chunk = stream.read(1600, exception_on_overflow=False)
+                if stop_event is not None and stop_event.is_set():
+                    return np.array([], dtype=np.float32)
+                chunk, stream = self._read_chunk_safely(pa, stream, 1600)
+                if chunk is None:
+                    return np.array([], dtype=np.float32)
                 frames.append(chunk)
                 total += 1
                 a = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
@@ -130,12 +269,19 @@ class STT:
                     silent = 0
                 elif speech_detected:
                     silent += 1
-                    if silent >= 15:  # 2.5s silence
+                    if silent >= 15:  # 1.5s silence
                         break
         finally:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                pa.terminate()
+            except Exception:
+                pass
         if not speech_detected:
             return np.array([], dtype=np.float32)
         return (
@@ -160,6 +306,30 @@ class STT:
     def transcribe(self, audio: np.ndarray) -> str:
         if len(audio) < 4800:
             return ""
+        t_start = time.perf_counter()
+
+        # Skip Whisper completely if Silero VAD detects no speech in raw audio
+        try:
+            import torch
+
+            vad_model = self._get_vad_model()
+            if hasattr(vad_model, "reset_states"):
+                vad_model.reset_states()
+            has_speech = False
+            float_audio = np.asarray(audio, dtype=np.float32).flatten()
+            for start in range(0, len(float_audio) - 511, 512):
+                chunk_t = torch.from_numpy(float_audio[start : start + 512])
+                if vad_model(chunk_t, config.SAMPLE_RATE).item() > 0.5:
+                    has_speech = True
+                    break
+            if hasattr(vad_model, "reset_states"):
+                vad_model.reset_states()
+            if not has_speech:
+                print("[stt] no speech detected by Silero VAD; skipping Whisper")
+                return ""
+        except Exception:
+            pass
+
         audio = self._normalize(audio)
         import mlx_whisper
 
@@ -230,6 +400,16 @@ class STT:
                 except Exception:
                     pass
 
+        # Filter non-English / non-Hindi hallucinations (e.g., Arabic/Chinese)
+        lang = detected or "en"
+        if lang not in ("en", "hi"):
+            print(f"[stt] discarding non-en/hi language: {lang}")
+            return ""
+        from .audio_guard import has_heavy_non_latin
+        if has_heavy_non_latin(text):
+            print("[stt] discarding non-latin text")
+            return ""
+
         # Filter hallucinations
         if not text or text.lower().strip(".,!?") in HALLUCINATIONS:
             print(f"[stt] filtered: {text!r} (lang={detected})")
@@ -240,6 +420,8 @@ class STT:
             return ""
 
         text = _apply_corrections(text)
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        print(f"[timing] stt_transcribe: {elapsed_ms:.0f}ms")
         print(f"[stt] heard (lang={detected}): {text!r}")
         return text
 

@@ -6,16 +6,24 @@ import os
 import re as _re
 import subprocess
 import sys
+import threading
 import time
 from .. import config
+from ..briefing import BriefingBuilder
 from ..brain.client import LLM, LLMError
 from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
+from ..core.context_tracker import ConversationContext
 from ..core.memory import Memory
+from ..voice import sfx
+from ..voice.audio_guard import is_barge_in_command, should_discard_transcript
 from ..voice.stt import STT
 from ..voice.tts import TTS
 from ..voice.wake import Hotkey, HOTKEY_DISPLAY, WakeWordDetector
+from ..ui.menubar import start_menubar
+from ..ui.notify import notify_alert, notify_result
 from ..actions.executor import execute_tool
-from ..actions.router import quick_route, RoutedCommand
+from ..actions.handlers import open_app, search_web
+from ..actions.router import copy_to_clipboard, execute_open, execute_search, quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
 
@@ -31,35 +39,57 @@ CHIME = "/System/Library/Sounds/Ping.aiff"
 MAX_TOOL_ROUNDS = 3
 
 MODEL_MAP = {
-    # "smart" aliases (qwen2.5:14b) disabled until model is pulled.
-    # Uncomment when `ollama pull qwen2.5:14b` succeeds.
-    "qwen": "qwen2.5:7b",
-    "queen": "qwen2.5:7b",
-    "qwen 7": "qwen2.5:7b",
-    "fast": "qwen2.5:7b",
-    "default": "qwen2.5:7b",
-    # "smart": "qwen2.5:14b",
-    # "qwen smart": "qwen2.5:14b",
-    # "qwen 14": "qwen2.5:14b",
-    # "big": "qwen2.5:14b",
-    # "large": "qwen2.5:14b",
-    # "brain": "qwen2.5:14b",
+    "qwen": "qwen2.5:3b",
+    "queen": "qwen2.5:3b",
+    "fast": "qwen2.5:3b",
+    "fast mode": "qwen2.5:3b",
+    "default": "qwen2.5:3b",
     "small": "qwen2.5:3b",
     "tiny": "qwen2.5:3b",
+    "smart": "qwen2.5:7b",
+    "smart mode": "qwen2.5:7b",
+    "qwen smart": "qwen2.5:7b",
+    "qwen 7": "qwen2.5:7b",
+    "big": "qwen2.5:7b",
+    "large": "qwen2.5:7b",
+    "brain": "qwen2.5:7b",
     "dolphin": "dolphin-uncensored:latest",
     "uncensored": "dolphin-uncensored:latest",
     "llama": "dolphin-llama3:8b",
 }
 
+_TOOL_INTENT_RE = _re.compile(
+    r"\b(remind|reminder|yaad|remember|save|fact|file|folder|search|find|trash|"
+    r"delete|move|rename|open|close|launch|quit|browser|tab|url|website|undo|"
+    r"weather|mausam|battery|cpu|ram|plan)\b",
+    _re.IGNORECASE,
+)
+
 YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "ok", "okay", "kar do", "karo", "confirm", "sure"}
 NO_WORDS = {"no", "nahi", "nah", "cancel", "stop", "mat karo", "band"}
+KNOWN_SINGLE_WORDS = {
+    "stop", "pause", "resume", "yes", "no", "help", "status",
+    "search", "open", "undo", "time", "weather", "cancel", "quiet",
+    "chup", "band", "ruko", "bas", "haan", "ok", "okay", "nahi",
+}
+
+
+class PendingIntent:
+    """Tracks a short-lived pending command waiting for the user's follow-up target."""
+
+    def __init__(self, intent_type: str, expires_seconds: float = 60.0):
+        self.type = intent_type
+        self.expires_at = time.time() + expires_seconds
+
+    def expired(self) -> bool:
+        return time.time() > self.expires_at
 
 
 class Agent:
     def __init__(self):
         self.memory = Memory()
         self.stt = STT()
-        self.tts = TTS(config.PIPER_VOICE)
+        self.tts = TTS(config.KOKORO_VOICE)
         self.llm = LLM()
         self.hotkey = Hotkey()
         self.wake_detector = None
@@ -72,7 +102,13 @@ class Agent:
         except Exception as e:
             print(f"[wake] WakeWordDetector unavailable ({e}); falling back to {HOTKEY_DISPLAY}.")
         self.scheduler = ReminderScheduler(self.memory, self.tts)
+        self.briefing = BriefingBuilder(memory=self.memory)
+        self.conv_ctx = ConversationContext(max_turns=10)
+        self.menubar = None
+        self.set_menubar_state = lambda _state: None
         self.continuous_mode = False
+        self.pending_intent: PendingIntent | None = None
+        self._startup_cal_warned: bool = False
         self._pending_confirm: callable | None = None
         self._pending_desc: str = ""
 
@@ -82,20 +118,29 @@ class Agent:
         except Exception:
             pass
 
+    def set_state(self, state: str) -> None:
+        """Update menubar state indicator."""
+        self.set_menubar_state(state)
+
     def _build_messages(self, user_text: str) -> list[dict]:
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
         facts = self.memory.all_facts()
         if facts:
             facts_str = "; ".join(f"{k}={v}" for k, v in facts.items())
             msgs.append({"role": "system", "content": f"Known facts: {facts_str}"})
-        for m in self.memory.recent_messages(limit=4):
+        for m in self.memory.get_recent_context(limit=10):
             msgs.append(m)
         msgs.append({"role": "user", "content": user_text})
         return msgs
 
     def _llm_with_tools(self, messages: list[dict]) -> str:
+        tool_model = (
+            config.OLLAMA_SMART_MODEL
+            if self.llm.model == config.OLLAMA_MODEL
+            else self.llm.model
+        )
         for _ in range(MAX_TOOL_ROUNDS):
-            result = self.llm.chat(messages, tools=TOOLS)
+            result = self.llm.chat(messages, tools=TOOLS, model=tool_model)
             tool_calls = result.get("tool_calls")
             if not tool_calls:
                 return _strip_emoji(result.get("content", ""))
@@ -121,12 +166,19 @@ class Agent:
 
     def _handle_model_switch(self, text: str) -> bool:
         lower = text.lower().strip()
-        if "switch to " not in lower and "switch model" not in lower:
+        if (
+            "switch to " not in lower
+            and "switch model" not in lower
+            and "smart mode" not in lower
+            and "fast mode" not in lower
+        ):
             return False
         if "switch to " in lower:
             target = lower.split("switch to ")[-1].strip().rstrip(".!?, ")
-        else:
+        elif "switch model" in lower:
             target = lower.replace("switch model", "").strip().rstrip(".!?, ")
+        else:
+            target = lower.rstrip(".!?, ")
         for k, v in MODEL_MAP.items():
             if k in target or target in k:
                 self.llm.set_model(v)
@@ -136,7 +188,8 @@ class Agent:
                 return True
         return True
 
-    def _process(self, text: str) -> str:
+    def _try_fast_path(self, text: str) -> tuple[bool, str]:
+        """Handle continuous mode, confirmations, model switching, memory resets, and quick_route."""
         lower_clean = text.lower().strip().rstrip(".!?, ")
 
         # START CONTINUOUS MODE
@@ -146,7 +199,7 @@ class Agent:
         )
         if any(phrase in lower_clean for phrase in start_phrases):
             self.continuous_mode = True
-            return "Continuous mode on. I'm listening. Say stop or band karo to exit."
+            return True, "Continuous mode on. I'm listening. Say stop or band karo to exit."
 
         # STOP CONTINUOUS MODE (exact/prefixed for short words so "Safari band karo" still closes Safari)
         stop_substrings = ("stop listening", "stop continuous", "stop mode")
@@ -165,9 +218,9 @@ class Agent:
         if is_stop_cmd:
             if self.continuous_mode:
                 self.continuous_mode = False
-                return "Continuous mode off. Waiting for wake word."
+                return True, "Continuous mode off. Waiting for wake word."
             if self._pending_confirm is None:
-                return "Waiting for wake word."
+                return True, "Waiting for wake word."
 
         # Pending confirmation check FIRST
         if self._pending_confirm is not None:
@@ -175,23 +228,21 @@ class Agent:
             if any(w in lower for w in YES_WORDS):
                 action = self._pending_confirm
                 self._pending_confirm = None
-                desc = self._pending_desc
                 self._pending_desc = ""
                 try:
-                    result = action()
-                    return result
+                    return True, action()
                 except Exception as e:
-                    return f"Action failed: {e}"
+                    return True, f"Action failed: {e}"
             elif any(w in lower for w in NO_WORDS):
                 self._pending_confirm = None
                 self._pending_desc = ""
-                return "Cancelled."
+                return True, "Cancelled."
             else:
-                return "Please say yes or no."
+                return True, "Please say yes or no."
 
         # Model switch
         if self._handle_model_switch(text):
-            return ""
+            return True, ""
 
         # Forget / clear history (fast path)
         lower_clean = text.lower().strip().rstrip(".!?")
@@ -199,41 +250,234 @@ class Agent:
                            "clear history", "clear memory",
                            "reset", "start fresh"):
             self.memory.clear_messages()
-            return "Forgotten. Fresh start."
+            return True, "Forgotten. Fresh start."
+
+        # Active pending intent check BEFORE routing / LLM (executes follow-up target directly)
+        if self.pending_intent is not None:
+            if self.pending_intent.expired():
+                self.pending_intent = None
+            else:
+                lower_pi = text.lower().strip().rstrip(".!?, ")
+                if lower_pi in NO_WORDS or lower_pi in ("never mind", "cancel"):
+                    self.pending_intent = None
+                    return True, "Cancelled."
+                if self.pending_intent.type == "search":
+                    self.pending_intent = None
+                    res = execute_search(text.strip())
+                    sfx.play_success()
+                    notify_result("Auronix", res[:160])
+                    return True, res
+                if self.pending_intent.type == "open_app":
+                    self.pending_intent = None
+                    res = execute_open(text.strip())
+                    sfx.play_success()
+                    notify_result("Auronix", res[:160])
+                    return True, res
+
+        # Explicit user confirmation for proposed AppleScript fix
+        if lower_clean == "run fix":
+            from ..actions.handlers import run_pending_fix
+            return True, run_pending_fix()
+
+        # Dynamic wake-word calibration ("calibrate wake word")
+        if "calibrate wake word" in lower_clean or "calibrate my voice" in lower_clean:
+            if self.wake_detector is None:
+                return True, "Wake word detector is not active."
+            avg_score, new_thresh = self.wake_detector.calibrate(self.stt, self.tts)
+            if avg_score == 0.0:
+                return True, "No speech detected during calibration. Threshold unchanged."
+            return True, (
+                f"Calibration complete. Average score {avg_score:.2f}, "
+                f"threshold set to {new_thresh:.2f}."
+            )
+
+        # Conversation context follow-ups ("open it again", "copy last response", etc.)
+        followup = self.conv_ctx.resolve_followup(text)
+        if followup is not None:
+            intent = followup.get("intent")
+            if intent == "open_app":
+                return True, open_app(followup["app"])
+            if intent == "read_last_response":
+                return True, followup["text"]
+            if intent == "copy_last_response":
+                return True, copy_to_clipboard(followup["text"])
+            if intent == "browser_search_in_app":
+                return True, search_web(followup["query"])
 
         # Deterministic router
-        routed = quick_route(text, self.memory)
+        try:
+            routed = quick_route(text, self.memory)
+        except Exception as e:
+            sfx.play_error()
+            self.set_menubar_state("error")
+            notify_alert("Auronix Error", str(e))
+            return True, f"Command failed: {e}"
+
         if routed is not None and routed.response == "__VISION_READ__":
             print("[vision] Capturing screen and analyzing...")
             from ..actions.handlers import read_screen_content
-            return _strip_emoji(read_screen_content(self.llm))
+            res = _strip_emoji(read_screen_content(self.llm))
+            sfx.play_success()
+            notify_result("Auronix", res[:160])
+            return True, res
 
         if routed is not None:
             print(f"[quick_route] {routed.response[:80]}")
+            if getattr(routed, "pending_intent", None):
+                self.pending_intent = PendingIntent(routed.pending_intent)
             if routed.needs_confirm:
                 self._pending_confirm = routed.confirm_action
                 self._pending_desc = routed.confirm_desc
-            return _strip_emoji(routed.response)
+                notify_alert("Auronix", f"Confirm: {routed.confirm_desc}")
+            else:
+                sfx.play_success()
+                notify_result("Auronix", routed.response[:160])
+            return True, _strip_emoji(routed.response)
 
-        # LLM fallback
-        messages = self._build_messages(text)
+        return False, ""
+
+    def _process(self, text: str) -> str:
         try:
+            handled, response = self._try_fast_path(text)
+            if handled:
+                return response
+
+            # LLM fallback
+            messages = self._build_messages(text)
             response = self._llm_with_tools(messages)
+            return _strip_emoji(response or "Done.")
         except LLMError as e:
             print(f"[llm error] {e}")
+            sfx.play_error()
+            self.set_menubar_state("error")
+            notify_alert("Auronix Error", str(e))
             return "I couldn't reach the language model."
-        return _strip_emoji(response or "Done.")
+        except Exception as e:
+            print(f"[process error] {e}")
+            sfx.play_error()
+            self.set_menubar_state("error")
+            notify_alert("Auronix Error", str(e))
+            return f"Something went wrong: {e}"
+
+    def _record_context(self, user_text: str, response: str) -> None:
+        """Update short-term ConversationContext with latest turn and active app."""
+        app_name: str | None = None
+        m = _re.search(
+            r"\b(?:open|khol|launch|start|bring)\s+([A-Za-z][A-Za-z0-9 ]{0,20})",
+            user_text,
+            _re.IGNORECASE,
+        )
+        if m:
+            candidate = m.group(1).strip().split()[0].title()
+            if candidate.lower() not in {"the", "a", "it", "that", "in", "my", "new", "tab"}:
+                app_name = candidate
+        self.conv_ctx.record_turn(user_text, response, app=app_name)
+
+    def _stream_reply(self, user_text: str, text_mode: bool, is_split: bool) -> None:
+        """Stream fast chit-chat tokens from Ollama directly into sentence-level TTS."""
+        messages = self._build_messages(user_text)
+        self.set_menubar_state("thinking")
+        t_llm = time.perf_counter()
+
+        def _clean_chunks():
+            try:
+                for chunk in self.llm.chat_stream(messages):
+                    cleaned = _EMOJI_RE.sub("", chunk)
+                    if cleaned:
+                        yield cleaned
+            finally:
+                print(f"[timing] llm_response: {(time.perf_counter() - t_llm) * 1000:.0f}ms")
+
+        barge_in_interrupted = threading.Event()
+        try:
+            if not text_mode:
+                self.set_menubar_state("speaking")
+                if self.continuous_mode:
+                    stop_vad = threading.Event()
+
+                    def _interrupt_listener() -> None:
+                        try:
+                            # Let Kokoro/sounddevice initialize before opening the PyAudio mic stream
+                            if stop_vad.wait(0.3):
+                                return
+                            audio = self.stt.record_until_silence(
+                                max_seconds=6.0, stop_event=stop_vad
+                            )
+                            if len(audio) > 0 and not stop_vad.is_set():
+                                barge_in_interrupted.set()
+                                self.tts.stop()
+                                self.set_state("listening")
+                        except Exception:
+                            pass
+
+                    vad_thread = threading.Thread(target=_interrupt_listener, daemon=True)
+                    vad_thread.start()
+                    try:
+                        response = self.tts.speak_stream(_clean_chunks(), wait=True)
+                    finally:
+                        stop_vad.set()
+                        vad_thread.join(timeout=0.5)
+                else:
+                    response = self.tts.speak_stream(
+                        _clean_chunks(),
+                        wait=is_split,
+                    )
+            else:
+                response = "".join(_clean_chunks()).strip()
+        except LLMError as e:
+            print(f"[llm error] {e}")
+            sfx.play_error()
+            self.set_menubar_state("error")
+            notify_alert("Auronix Error", str(e))
+            response = "I couldn't reach the language model."
+            if not text_mode:
+                self.set_menubar_state("speaking")
+                self.tts.speak_async(response)
+                if self.continuous_mode or is_split:
+                    time.sleep(min(15.0, (len(response) * 0.08) + 2.5))
+
+        response = _strip_emoji(response) or "Done."
+        print(f"Auronix: {response}")
+        self.memory.add_message("user", user_text)
+        self.memory.add_message("assistant", response)
+        self._record_context(user_text, response)
+        if not text_mode and self.continuous_mode and not is_split and not barge_in_interrupted.is_set():
+            time.sleep(0.4)
+            print("[continuous] Resuming listening...")
 
     def _execute_and_reply(self, user_text: str, text_mode: bool, is_split: bool = False) -> None:
         """Process one user utterance, persist the turn, and speak in voice mode."""
         print(f"You: {user_text}")
-        response = self._process(user_text)
+        self.set_menubar_state("thinking")
+        t_proc = time.perf_counter()
+        if getattr(self._process, "__func__", None) is Agent._process:
+            handled, response = self._try_fast_path(user_text)
+            if not handled:
+                if _TOOL_INTENT_RE.search(user_text) or self.llm.model == config.OLLAMA_SMART_MODEL:
+                    messages = self._build_messages(user_text)
+                    try:
+                        response = self._llm_with_tools(messages) or "Done."
+                    except LLMError as e:
+                        print(f"[llm error] {e}")
+                        sfx.play_error()
+                        self.set_menubar_state("error")
+                        notify_alert("Auronix Error", str(e))
+                        response = "I couldn't reach the language model."
+                else:
+                    self._stream_reply(user_text, text_mode, is_split)
+                    return
+        else:
+            response = self._process(user_text)
+
         if not response:
             return
+        print(f"[timing] llm_response: {(time.perf_counter() - t_proc) * 1000:.0f}ms")
         print(f"Auronix: {response}")
         self.memory.add_message("user", user_text)
         self.memory.add_message("assistant", response)
+        self._record_context(user_text, response)
         if not text_mode:
+            self.set_menubar_state("speaking")
             self.tts.speak_async(response)
             if self.continuous_mode or is_split:
                 # Wait for TTS to finish based on response length (~0.08s/char + 2.5s buffer)
@@ -242,24 +486,57 @@ class Agent:
                 if not is_split:
                     print("[continuous] Resuming listening...")
 
+    def _prefetch_briefing_context(self, speak_cal_warning: bool = False) -> None:
+        """Warm calendar and briefing caches in background during startup."""
+        if not (hasattr(self, "briefing") and self.briefing):
+            return
+
+        def _warm() -> None:
+            try:
+                from ..briefing.calendar import get_today_events
+                cal_data = get_today_events()
+                if (
+                    speak_cal_warning
+                    and not self._startup_cal_warned
+                    and cal_data.get("available") is False
+                    and cal_data.get("reason") == "calendar_permission_denied"
+                ):
+                    self._startup_cal_warned = True
+                    print("[briefing] Calendar unavailable: calendar_permission_denied")
+                    self.tts.speak("Calendar access not available. Please enable in System Settings.")
+            except Exception as e:
+                print(f"[prewarm] calendar failed: {e}")
+
+        threading.Thread(target=_warm, daemon=True).start()
+
     def run(self, text_mode: bool = False):
         print("Loading models...")
         if not text_mode:
+            # Start Calendar prewarm concurrently with model loading so cold-start cost is hidden
+            self._prefetch_briefing_context(speak_cal_warning=True)
             self.stt.preload()
             try:
                 self.tts.preload()
             except Exception:
                 pass
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                try:
+                    self.menubar, self.set_menubar_state = start_menubar()
+                except Exception as e:
+                    print(f"[menubar] unavailable: {e}")
         self.llm.warmup()
         current = self.llm.model
         trigger_hint = "Say 'Auronix'" if self.wake_detector is not None else f"Press {HOTKEY_DISPLAY}"
         print(f"Auronix ready. Model: {current}. {trigger_hint} to activate.")
         if not text_mode:
+            self.set_menubar_state("speaking")
             self.tts.speak("Auronix ready")
+            self.set_menubar_state("idle")
 
         self.scheduler.start()
         try:
             while True:
+                current = self.llm.model
                 if text_mode:
                     try:
                         text = input(f"\n[{current}] Type: ").strip()
@@ -269,6 +546,7 @@ class Agent:
                         break
                 else:
                     if not self.continuous_mode:
+                        self.set_menubar_state("idle")
                         if self.wake_detector is not None:
                             print("Waiting for wake word 'Auronix'...")
                             if not self.wake_detector.wait_for_wake():
@@ -277,18 +555,69 @@ class Agent:
                             print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}... (or say 'start listening')")
                             if not self.hotkey.wait():
                                 break
+                        sfx.play_wake()
+                        self.set_menubar_state("wake")
+                        # PHASE D: First wake of the day = briefing
+                        wake_ms = getattr(self.wake_detector, "last_detect_ms", 0.0) if self.wake_detector is not None else 0.0
+                        print(f"[timing] wake_detect: {wake_ms:.0f}ms")
+                        print("[wake] detected")
+                        if hasattr(self, "briefing") and self.briefing:
+                            if self.briefing.should_deliver_today():
+                                print("[briefing] Delivering morning briefing...")
+                                self.briefing.speak_briefing(self.tts)
+                                time.sleep(0.25)
+                                self.conv_ctx.record_turn("[wake]", "(briefing delivered)")
+                                continue  # Skip recording, wait for next wake
                     else:
                         print(f"\n[{current}] Continuous mode active. Listening...")
                     print("Listening...")
                     self._chime()
+                    sfx.play_listening()
+                    self.set_menubar_state("listening")
                     try:
                         audio = self.stt.record()
                     except KeyboardInterrupt:
                         continue
                     if len(audio) < 3200:
                         continue
+                    self.set_menubar_state("thinking")
                     text = self.stt.transcribe(audio).strip()
-                    if not text:
+                    last_tts = (
+                        getattr(self.tts, "last_spoken_text", "")
+                        or getattr(self.conv_ctx, "last_response", "")
+                    )
+                    if should_discard_transcript(text, last_tts):
+                        print(f"[filter] Discarded: {text[:40]!r}")
+                        continue
+
+                    # Additional repeat-loop filter (specific to STT hallucinations)
+                    words = text.strip().split()
+                    if len(words) >= 4:
+                        max_consec = 1
+                        cur = 1
+                        for i in range(1, len(words)):
+                            if words[i].lower().strip(".,!?।") == words[i - 1].lower().strip(".,!?।"):
+                                cur += 1
+                                max_consec = max(max_consec, cur)
+                            else:
+                                cur = 1
+                        if max_consec >= 3:
+                            print(f"[filter] Repeat loop detected ({max_consec}x)")
+                            continue
+
+                    # Reject isolated single-word hallucinations unless known command or awaiting pending intent
+                    has_active_intent = self.pending_intent is not None and not self.pending_intent.expired()
+                    if (
+                        len(words) == 1
+                        and words[0].lower().rstrip(".,!?") not in KNOWN_SINGLE_WORDS
+                        and not has_active_intent
+                        and self._pending_confirm is None
+                    ):
+                        print(f"[filter] single-word garbage: {text!r}")
+                        continue
+
+                    if is_barge_in_command(text):
+                        self.tts.stop()
                         continue
 
                 text_lower = text.lower()
@@ -318,6 +647,11 @@ class Agent:
             self.scheduler.stop()
             if hasattr(self, "wake_detector") and self.wake_detector:
                 self.wake_detector.close()
+            if getattr(self, "menubar", None) is not None:
+                try:
+                    self.menubar.terminate()
+                except Exception:
+                    pass
             # Force clean exit on real CLI shutdown to avoid hanging PyAudio/ONNX thread atexit tracebacks
             if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
                 sys.stdout.flush()

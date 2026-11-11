@@ -155,3 +155,10 @@ _VISION_PATTERNS = [
     r"read (it|them) (all |carefully )?(out |aloud )?",
 ]
 
+_CALENDAR_PATTERNS = [
+    r"\b(what'?s|whats|what is|show|tell).{0,15}(on today|my (schedule|day|calendar)|today'?s (events|schedule))",
+    r"\b(today|aaj).{0,10}(schedule|calendar|events|ka kya)",
+    r"\b(learn today|learn's today)\b",  # STT error for "what's on today"
+    r"\bis on today\b",  # STT error fragment
+]
+

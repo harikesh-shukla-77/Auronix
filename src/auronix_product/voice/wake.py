@@ -117,6 +117,7 @@ class WakeWordDetector:
         self._buffer = torch.zeros(self.window_samples, dtype=torch.float32)
         self._above = 0
         self._last_trigger_time = -1e9
+        self.last_detect_ms: float = 0.0
 
     def reset(self) -> None:
         """Clear rolling buffer and filter state between wake cycles."""
@@ -144,6 +145,7 @@ class WakeWordDetector:
         else:
             self._buffer = self._torch.cat([self._buffer[n:], filt_new])
 
+        t_chunk0 = time.perf_counter()
         passed, _ = self._gate(self._buffer)
         if not passed:
             self._above = 0
@@ -164,35 +166,141 @@ class WakeWordDetector:
             self._above >= self.consecutive_frames
             and (now - self._last_trigger_time) > self.refractory_seconds
         ):
+            self.last_detect_ms = (time.perf_counter() - t_chunk0) * 1000
             self._last_trigger_time = now
             self._above = 0
             return True
         return False
+
+    def score_clip(self, audio) -> float:
+        """Evaluate the ONNX wake model across a recorded clip and return max probability."""
+        from heed.audio import log_mel, peak_normalize
+
+        if self.session is None:
+            return 0.0
+        samples = self._np.asarray(audio, dtype=self._np.float32).flatten()
+        if samples.size == 0:
+            return 0.0
+
+        self.reset()
+        max_prob = 0.0
+        for start in range(0, samples.size, self.chunk_samples):
+            chunk = samples[start : start + self.chunk_samples]
+            filt_new = self._hpf(self._torch.from_numpy(chunk))
+            n = filt_new.numel()
+            if n >= self.window_samples:
+                self._buffer = filt_new[-self.window_samples:].clone()
+            else:
+                self._buffer = self._torch.cat([self._buffer[n:], filt_new])
+            passed, _ = self._gate(self._buffer)
+            if not passed:
+                continue
+            normalized = peak_normalize(self._buffer, target_dbfs=self._target_dbfs)
+            mel = log_mel(normalized, apply_cmn=True).numpy().astype(self._np.float32)
+            raw_out = self.session.run(None, {self.input_name: mel})[0]
+            logit = float(self._np.asarray(raw_out).flatten()[0])
+            prob = 1.0 / (1.0 + math.exp(-max(-50.0, min(50.0, logit))))
+            if prob > max_prob:
+                max_prob = prob
+        self.reset()
+        return max_prob
+
+    @staticmethod
+    def save_wake_threshold(threshold: float, config_path: str | Path | None = None) -> float:
+        """Persist calibrated wake threshold to ~/.auronix/config.json."""
+        from .. import config
+
+        target = Path(config_path or config.WAKE_CONFIG_PATH)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if target.exists():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        clamped = round(max(0.75, min(0.95, float(threshold))), 3)
+        existing["wake_threshold"] = clamped
+        target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        if config_path is None:
+            config.WAKE_THRESHOLD = clamped
+        return clamped
+
+    def calibrate(
+        self,
+        stt,
+        tts=None,
+        samples_dir: str | Path | None = None,
+        config_path: str | Path | None = None,
+    ) -> tuple[float, float]:
+        """Record 3 user samples of 'Auronix', score them, and tune threshold dynamically."""
+        from heed.audio import save_wav
+        from .. import config
+
+        out_dir = Path(samples_dir or config.WAKE_SAMPLES_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if tts is not None:
+            tts.speak("Please say 'Auronix' 3 times clearly.")
+
+        scores: list[float] = []
+        for idx in range(1, 4):
+            audio = stt.record_until_silence(max_seconds=4.0)
+            if len(audio) > 0:
+                save_wav(out_dir / f"sample_{idx}.wav", audio)
+                scores.append(self.score_clip(audio))
+
+        if not scores:
+            return 0.0, self.threshold
+
+        avg_score = sum(scores) / len(scores)
+        new_threshold = round(max(0.75, min(0.90, avg_score - 0.05)), 3)
+        saved = self.save_wake_threshold(new_threshold, config_path=config_path)
+        self.threshold = saved
+        return avg_score, saved
 
     def wait_for_wake(self) -> bool:
         import pyaudio
 
         self.reset()
         p = pyaudio.PyAudio()
-        stream = p.open(
+        open_kwargs = dict(
             rate=self.sample_rate,
             channels=1,
             format=pyaudio.paInt16,
             input=True,
             frames_per_buffer=self.chunk_samples,
         )
+        stream = p.open(**open_kwargs)
         print(f"Listening for wake word '{self.phrase}'...")
+        read_retries = 0
         try:
             while True:
-                pcm = stream.read(self.chunk_samples, exception_on_overflow=False)
+                try:
+                    pcm = stream.read(self.chunk_samples, exception_on_overflow=False)
+                    read_retries = 0
+                except (OSError, IOError) as e:
+                    read_retries += 1
+                    print(f"[wake] audio read failed (attempt {read_retries}/3): {e}")
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    if read_retries >= 3:
+                        return False
+                    stream = p.open(**open_kwargs)
+                    continue
                 audio = self._np.frombuffer(pcm, dtype=self._np.int16).astype(self._np.float32) / 32768.0
                 if self.process_chunk(audio):
                     return True
         except KeyboardInterrupt:
             return False
         finally:
-            stream.stop_stream()
-            stream.close()
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
             p.terminate()
 
     def close(self) -> None:

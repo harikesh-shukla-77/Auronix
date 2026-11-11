@@ -1,3 +1,10 @@
+import os
+import warnings
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import sys
 from .core.agent import Agent
 

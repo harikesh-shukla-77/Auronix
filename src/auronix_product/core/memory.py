@@ -50,13 +50,17 @@ class Memory:
             conn.commit()
 
     def recent_messages(self, session_id: str = "default", limit: int = 4) -> list[dict]:
-        """Only last 4 messages — enough context, not enough to poison."""
+        """Return the most recent messages for a session in chronological order."""
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+    def get_recent_context(self, limit: int = 10, session_id: str = "default") -> list[dict]:
+        """Return the last `limit` conversation turns from persistent SQLite memory."""
+        return self.recent_messages(session_id=session_id, limit=limit)
 
     def clear_messages(self, session_id: str | None = None):
         """Clear all messages, or just one session."""

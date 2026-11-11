@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
     <string>Auronix</string>
     <key>CFBundleIdentifier</key>
-    <string>com.harikeshshukla.auronix</string>
+    <string>com.harikesh.auronix</string>
     <key>CFBundleName</key>
     <string>Auronix</string>
     <key>CFBundleDisplayName</key>
@@ -18,10 +19,17 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Auronix needs microphone access to hear your voice commands.</string>
+    <string>Auronix needs microphone to listen for wake word and voice commands.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Auronix needs speech recognition to understand voice commands.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Auronix reads today's calendar events for your morning briefing.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Auronix needs Automation access to control macOS apps and read your Calendar and Reminders.</string>
 </dict>
 </plist>
-

@@ -1,7 +1,18 @@
 """Deterministic regex command router."""
 
 import datetime
+from pathlib import Path
 import re
+import subprocess
+import time
+import urllib.parse
+from ..briefing import (
+    calendar as briefing_calendar,
+    reminders as briefing_reminders,
+    system_status as briefing_system_status,
+    weather as briefing_weather,
+)
+from ..voice import audio_guard
 from .patterns import (
     _TIME_PATTERNS, _WEATHER_PATTERNS, _DATE_PATTERNS, _SYSTEM_PATTERNS,
     _OPEN_PATTERNS, _CLOSE_PATTERNS, _BRING_FRONT_PATTERNS, _MINIMIZE_PATTERNS,
@@ -11,6 +22,7 @@ from .patterns import (
     _REMINDER_PATTERNS, _REMIND_IN_PATTERNS, _REMIND_AT_PATTERNS,
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
     _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
+    _CALENDAR_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
@@ -54,14 +66,84 @@ def _clean_app_name(name: str) -> str:
     return " ".join(cleaned) if cleaned else name
 
 
+def _take_screenshot() -> str:
+    """Save a Desktop screenshot with a timestamp filename."""
+    out_path = Path.home() / "Desktop" / f"auronix_shot_{int(time.time())}.png"
+    try:
+        subprocess.run(["screencapture", "-x", str(out_path)], check=True, timeout=5)
+        return f"Screenshot saved to Desktop as {out_path.name}."
+    except Exception as e:
+        return f"Screenshot failed: {e}"
+
+
+def copy_to_clipboard(text: str) -> str:
+    """Copy text to the macOS clipboard via pbcopy."""
+    if not text:
+        return "No previous response to copy."
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+        return "Copied last response to clipboard."
+    except Exception as e:
+        return f"Copy failed: {e}"
+
+
+_BROWSER_APP_MAP = {
+    "safari": "Safari",
+    "chrome": "Google Chrome",
+    "google chrome": "Google Chrome",
+    "arc": "Arc",
+    "firefox": "Firefox",
+    "brave": "Brave Browser",
+    "edge": "Microsoft Edge",
+}
+
+
+def execute_search(query: str) -> str:
+    """Execute web search, routing to a specific browser when 'in <browser>' is given."""
+    clean = query.strip().rstrip(".!?, ")
+    if not clean:
+        return "What would you like to search for?"
+
+    m = re.search(
+        r"^(.+?)\s+in\s+(safari|chrome|google chrome|arc|firefox|brave|edge)\s*$",
+        clean,
+        re.IGNORECASE,
+    )
+    if m:
+        search_term = m.group(1).strip()
+        browser_key = m.group(2).lower()
+        browser_app = _BROWSER_APP_MAP.get(browser_key, m.group(2).title())
+        url = f"https://www.google.com/search?q={urllib.parse.quote(search_term)}"
+        try:
+            subprocess.run(["open", "-a", browser_app, url], check=True, timeout=10)
+            return f"Searching for {search_term} in {browser_app}."
+        except Exception as e:
+            return f"Search failed: {e}"
+
+    return search_web(clean)
+
+
+def execute_open(target: str) -> str:
+    """Execute app or URL launch for a pending open_app intent."""
+    clean = target.strip().rstrip(".!?, ")
+    if not clean:
+        return "Which app would you like me to open?"
+    if re.match(r"^(?:https?://[^\s]+|[a-zA-Z0-9.-]+\.(?:com|org|net|in|io|co|ai|dev|edu|gov)(?:/[^\s]*)?)$", clean):
+        return open_url(clean)
+    app_name = _clean_app_name(clean).title()
+    return open_app(app_name)
+
+
 class RoutedCommand:
-    """Result from quick_route. Includes pending confirmation for L3/L4."""
+    """Result from quick_route. Includes pending confirmation for L3/L4 and pending intent."""
     def __init__(self, response: str, needs_confirm: bool = False,
-                 confirm_action: callable = None, confirm_desc: str = ""):
+                 confirm_action: callable = None, confirm_desc: str = "",
+                 pending_intent: str | None = None):
         self.response = response
         self.needs_confirm = needs_confirm
         self.confirm_action = confirm_action
         self.confirm_desc = confirm_desc
+        self.pending_intent = pending_intent
 
 
 def quick_route(text: str, memory) -> RoutedCommand | None:
@@ -71,6 +153,41 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
     if "remind" in lower or "reminder" in lower:
         print(f"[router-debug] reminder input: {lower!r}")
         print(f"[router-debug] normalized:    {normalized_lower!r}")
+
+    # CALENDAR — "What's on today" (deterministic, no LLM)
+    for pat in _CALENDAR_PATTERNS:
+        if re.search(pat, lower):
+            data = briefing_calendar.get_today_events()
+            if not data.get("available"):
+                if data.get("reason") == "timeout":
+                    return RoutedCommand("Calendar is still syncing in the background.")
+                return RoutedCommand(f"Calendar unavailable: {data.get('reason', 'unknown')}")
+            if not data.get("events"):
+                return RoutedCommand("Nothing on your calendar today.")
+            events = data["events"][:5]
+            return RoutedCommand("Today: " + "; ".join(events))
+
+    # 0. SAFE PHASE-D COMMANDS
+    if re.search(r"\b(?:audio|mic|microphone)\s+status\b", lower):
+        return RoutedCommand(audio_guard.get_audio_status_report())
+
+    if re.search(r"\btake\s+(?:a\s+)?screenshot\b", lower):
+        return RoutedCommand(_take_screenshot())
+
+    if lower in ("copy last response", "copy the last response", "copy that response"):
+        last_assistant = ""
+        if memory is not None:
+            for msg in reversed(memory.recent_messages(limit=6)):
+                if msg.get("role") == "assistant" and msg.get("content"):
+                    last_assistant = msg["content"]
+                    break
+        return RoutedCommand(copy_to_clipboard(last_assistant))
+
+    if lower in ("search", "google", "search web", "web search", "khojo"):
+        return RoutedCommand("Sure, what would you like to search for?", pending_intent="search")
+
+    if lower in ("open", "launch", "open app", "kholo"):
+        return RoutedCommand("Which app would you like me to open?", pending_intent="open_app")
 
     # 1. NAME SAVE / RECALL
     for pat in _SAVE_NAME_PATTERNS:
@@ -118,6 +235,9 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
                     return RoutedCommand(trash_file(filename))
 
     # 6. REMINDERS (deterministic, before time/weather/open)
+    if re.search(r"\bwhat.{0,10}my reminders\b|\bdue reminders\b", lower):
+        return RoutedCommand(briefing_reminders.get_due_reminders(memory)["summary"])
+
     if any(re.search(pat, lower) or re.search(pat, normalized_lower) for pat in _LIST_REMIND_PATTERNS):
         return RoutedCommand(list_reminders(memory))
 
@@ -203,7 +323,7 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
 
     # WEATHER
     if any(re.search(pat, lower) for pat in _WEATHER_PATTERNS):
-        return RoutedCommand(get_weather(_extract_city(text)))
+        return RoutedCommand(briefing_weather.get_weather(_extract_city(text))["summary"])
 
     # DATE
     if any(re.search(pat, lower) for pat in _DATE_PATTERNS):
@@ -211,7 +331,7 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
 
     # SYSTEM
     if any(re.search(pat, lower) for pat in _SYSTEM_PATTERNS):
-        return RoutedCommand(system_status())
+        return RoutedCommand(briefing_system_status.get_system_status()["summary"])
 
     # MINIMIZE ALL
     if any(re.search(pat, lower) for pat in _MINIMIZE_PATTERNS):

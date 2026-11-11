@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import base64
+import json
 import httpx
 from .. import config
 
@@ -19,8 +20,13 @@ class LLM:
     def set_model(self, model: str):
         self.model = model
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        payload = {"model": self.model, "messages": messages, "stream": False}
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        model: str | None = None,
+    ) -> dict:
+        payload = {"model": model or self.model, "messages": messages, "stream": False}
         if tools:
             payload["tools"] = tools
         try:
@@ -35,6 +41,30 @@ class LLM:
             raise LLMError(f"Ollama unreachable: {e}") from e
         except (KeyError, ValueError) as e:
             raise LLMError(f"Bad response: {e}") from e
+
+    def chat_stream(self, messages: list[dict], model: str | None = None):
+        """Yield incremental text chunks from Ollama using stream=True."""
+        payload = {
+            "model": model or self.model,
+            "messages": messages,
+            "stream": True,
+        }
+        try:
+            with self._client.stream("POST", f"{self.url}/api/chat", json=payload) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    chunk = data.get("message", {}).get("content", "")
+                    if chunk:
+                        yield chunk
+                    if data.get("done"):
+                        break
+        except httpx.HTTPError as e:
+            raise LLMError(f"Ollama stream error: {e}") from e
+        except (KeyError, ValueError) as e:
+            raise LLMError(f"Bad stream response: {e}") from e
 
     def vision_chat(self, prompt: str, image_path: str,
                     model: str = "minicpm-v") -> str:

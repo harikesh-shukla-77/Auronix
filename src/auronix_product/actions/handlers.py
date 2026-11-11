@@ -198,6 +198,77 @@ def list_reminders(memory) -> str:
     return "\n".join(lines)
 
 
+# ============ AppleScript helper (no auto-execution on failure) ============
+
+_pending_applescript_fix: str | None = None
+
+
+def _run_applescript_safe(script: str, context: str, timeout: int = 15) -> str:
+    """Run AppleScript; on error, propose an LLM fix for explicit user confirmation."""
+    global _pending_applescript_fix
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        error_msg = (e.stderr or str(e)).strip()
+        print(f"[applescript error] {error_msg}")
+        from .. import config
+        from ..brain.client import LLM, LLMError
+
+        llm = LLM()
+        fix_prompt = (
+            "AppleScript failed:\n"
+            f"Script: {script}\n"
+            f"Error: {error_msg}\n"
+            f"Context: {context}\n\n"
+            "Write a corrected AppleScript that does the same thing but avoids the error.\n"
+            "Only output the fixed script code, no explanation."
+        )
+        try:
+            try:
+                fixed = llm.chat(
+                    [{"role": "user", "content": fix_prompt}],
+                    model="qwen2.5-coder:7b",
+                )["content"]
+            except LLMError:
+                fixed = llm.chat(
+                    [{"role": "user", "content": fix_prompt}],
+                    model=config.OLLAMA_SMART_MODEL,
+                )["content"]
+            fixed = fixed.replace("```applescript", "").replace("```", "").strip()
+            _pending_applescript_fix = fixed
+            return f"AppleScript failed: {error_msg}. Proposed fix: {fixed}. Say 'run fix' to execute."
+        except Exception as llm_err:
+            return f"Failed: {error_msg} (could not generate fix: {llm_err})"
+
+
+def run_pending_fix(timeout: int = 15) -> str:
+    """Execute the last proposed AppleScript fix after explicit user confirmation."""
+    global _pending_applescript_fix
+    script = _pending_applescript_fix
+    if not script:
+        return "No pending AppleScript fix to run."
+    _pending_applescript_fix = None
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        out = result.stdout.strip()
+        return f"Executed fix: {out}" if out else "Executed fix successfully."
+    except Exception as e:
+        return f"Proposed fix failed: {e}"
+
+
 # ============ L2 — Reversible actions with undo ============
 
 def open_app(name: str) -> str:
@@ -217,10 +288,13 @@ def open_app(name: str) -> str:
 
 def close_app(name: str) -> str:
     try:
-        subprocess.run(
-            ["osascript", "-e", f'tell application "{name}" to quit'],
-            check=True, timeout=10,
+        out = _run_applescript_safe(
+            f'tell application "{name}" to quit',
+            f"close application {name}",
+            timeout=10,
         )
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         # Closing app can be undone by reopening, but state (windows) is lost.
         # Don't record as undoable — too complex.
         return f"Closed {name}."
@@ -231,7 +305,9 @@ def close_app(name: str) -> str:
 def bring_to_front(app_name: str) -> str:
     try:
         script = f'tell application "{app_name}" to activate'
-        subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+        out = _run_applescript_safe(script, f"bring {app_name} to front", timeout=10)
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         return f"Brought {app_name} to front."
     except Exception as e:
         return f"Could not activate {app_name}: {e}"
@@ -245,7 +321,9 @@ def close_all_windows(app_name: str) -> str:
             close every window
         end tell
         '''
-        subprocess.run(["osascript", "-e", script], check=True, timeout=15)
+        out = _run_applescript_safe(script, f"close all windows of {app_name}", timeout=15)
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         return f"Closed all {app_name} windows."
     except Exception as e:
         return f"Could not close {app_name} windows: {e}"
@@ -262,7 +340,9 @@ def minimize_all() -> str:
             end tell
         end tell
         '''
-        subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+        out = _run_applescript_safe(script, "minimize front app windows", timeout=10)
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         return "Minimized."
     except Exception as e:
         return f"Could not minimize: {e}"
@@ -420,10 +500,13 @@ def search_files(query: str, folder: str = "") -> str:
 def empty_trash() -> str:
     """L4 — permanently empty the Trash."""
     try:
-        subprocess.run(
-            ["osascript", "-e", 'tell application "Finder" to empty trash'],
-            check=True, timeout=30,
+        out = _run_applescript_safe(
+            'tell application "Finder" to empty trash',
+            "empty macOS Trash",
+            timeout=30,
         )
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         return "Emptied trash. This cannot be undone."
     except Exception as e:
         return f"Empty trash failed: {e}"
@@ -477,7 +560,9 @@ def open_new_tab(browser: str = "Safari") -> str:
         else 'tell application "Google Chrome" to make new window'
     )
     try:
-        subprocess.run(["osascript", "-e", script], check=True, timeout=10)
+        out = _run_applescript_safe(script, f"open new tab in {app_name}", timeout=10)
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
         return f"Opened new tab in {app_name}."
     except Exception as e:
         return f"Failed to open new tab: {e}"

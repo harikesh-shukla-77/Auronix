@@ -1,8 +1,13 @@
-#!/bin/bash
-# Launch Auronix from its virtual environment
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-cd "$SCRIPT_DIR/../../.." || exit 1
-source .venv/bin/activate
-# Start the app
-exec python -m auronix_product "$@"
+#!/bin/zsh
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PYTHONUNBUFFERED=1
+cd /Users/harikeshshukla/Auronix || exit 1
 
+# Ensure Ollama is running
+if ! pgrep -x "ollama" > /dev/null; then
+    /opt/homebrew/bin/ollama serve >/tmp/ollama.log 2>&1 &
+    sleep 2
+fi
+
+exec /Users/harikeshshukla/Auronix/.venv/bin/python -u -m auronix_product "$@" \
+    >>/tmp/auronix.log 2>>/tmp/auronix.err.log

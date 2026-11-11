@@ -39,6 +39,8 @@ def test_dynamic_tts_wait_in_continuous_and_split_mode(tmp_path, monkeypatch):
 
     agent = agent_mod.Agent()
     agent.tts.speak_async = MagicMock()
+    monkeypatch.setattr(agent_mod.sfx, "play_success", MagicMock())
+    monkeypatch.setattr(agent_mod, "notify_result", MagicMock())
     sleeps: list[float] = []
     monkeypatch.setattr(agent_mod.time, "sleep", sleeps.append)
 
@@ -188,3 +190,78 @@ def test_combined_browser_search_not_split_and_routes(tmp_path, monkeypatch):
 
     agent.run(text_mode=True)
     assert seen_inputs == ["open browser and search python"]
+
+
+def test_streaming_chat_and_tts_sentences(monkeypatch):
+    from contextlib import contextmanager
+    from auronix_product.brain.client import LLM
+    from auronix_product.voice.tts import TTS
+
+    # Test LLM.chat_stream NDJSON parsing
+    llm = LLM(model="qwen2.5:3b")
+    fake_stream_resp = MagicMock()
+    fake_stream_resp.iter_lines.return_value = [
+        '{"message": {"content": "Hello "}, "done": false}',
+        '{"message": {"content": "world! "}, "done": false}',
+        '{"message": {"content": "Wait 3.5 seconds."}, "done": true}',
+    ]
+
+    @contextmanager
+    def fake_stream(method, url, json=None):
+        assert method == "POST"
+        assert json["stream"] is True
+        assert json["model"] == "qwen2.5:3b"
+        yield fake_stream_resp
+
+    llm._client.stream = fake_stream
+    chunks = list(llm.chat_stream([{"role": "user", "content": "hi"}]))
+    assert chunks == ["Hello ", "world! ", "Wait 3.5 seconds."]
+
+    # Test TTS.speak_stream sentence boundary splitting without splitting decimals
+    tts = TTS()
+    spoken: list[str] = []
+    monkeypatch.setattr(tts, "_speak_and_wait", spoken.append)
+
+    def gen():
+        yield "Hello "
+        yield "world! Wait 3.5 "
+        yield "seconds. Tail"
+
+    full = tts.speak_stream(gen(), wait=True)
+    assert full == "Hello world! Wait 3.5 seconds. Tail"
+    assert spoken == ["Hello world!", "Wait 3.5 seconds.", "Tail"]
+
+
+def test_fast_chit_chat_vs_smart_tool_model(tmp_path, monkeypatch):
+    import auronix_product.core.agent as agent_mod
+    from auronix_product import config
+
+    mem = Memory(db_path=tmp_path / "models.db")
+    monkeypatch.setattr(agent_mod, "Memory", lambda: mem)
+
+    agent = agent_mod.Agent()
+    assert agent.llm.model == "qwen2.5:3b"
+    assert config.OLLAMA_SMART_MODEL == "qwen2.5:7b"
+
+    # General chit-chat streams via qwen2.5:3b + speak_stream
+    agent.llm.chat_stream = MagicMock(return_value=iter(["Doing great. ", "You?"]))
+    agent.tts.speak_stream = MagicMock(side_effect=lambda gen, wait=False: "".join(gen))
+    agent.llm.chat = MagicMock()
+
+    agent._execute_and_reply("how are you", text_mode=False)
+    agent.llm.chat_stream.assert_called_once()
+    agent.tts.speak_stream.assert_called_once()
+    agent.llm.chat.assert_not_called()
+
+    # Tool-intent query escalates to qwen2.5:7b via _llm_with_tools
+    agent.llm.chat.return_value = {"content": "Reminder set.", "tool_calls": None}
+    agent.tts.speak_async = MagicMock()
+    agent._execute_and_reply("remind me tomorrow at 10am to call mom", text_mode=False)
+    assert agent.llm.chat.call_args.kwargs["model"] == "qwen2.5:7b"
+
+    # Explicit smart mode / fast mode switching
+    agent.tts.speak = MagicMock()
+    agent._execute_and_reply("switch to smart", text_mode=True)
+    assert agent.llm.model == "qwen2.5:7b"
+    agent._execute_and_reply("switch to fast", text_mode=True)
+    assert agent.llm.model == "qwen2.5:3b"
