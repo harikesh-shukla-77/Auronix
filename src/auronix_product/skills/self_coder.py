@@ -21,6 +21,7 @@ from auronix.verification.verifier import CheckResult, Verifier
 
 from .. import config
 from ..brain.client import LLM
+from ..core.logger import get_logger
 from .reviewer import CodeReviewer
 
 DOLPHIN_SYSTEM_PROMPT = (
@@ -151,6 +152,7 @@ class SelfCoder:
         verifier: Verifier | None = None,
         reviewer: CodeReviewer | None = None,
         memory=None,
+        logger=None,
     ):
         self.repo_root = Path(repo_root).resolve() if repo_root else Path(__file__).resolve().parents[3]
         self.llm = llm or LLM()
@@ -163,6 +165,7 @@ class SelfCoder:
         self.verifier = verifier or Verifier("auronix-self-coder")
         self.reviewer = reviewer or CodeReviewer(llm=self.llm)
         self.memory = memory
+        self.logger = logger or get_logger("auronix.self_coder")
         self.last_backup_path: Path | None = None
         self.last_verification = None
         self.last_review: dict | None = None
@@ -444,11 +447,28 @@ class SelfCoder:
         self.last_verification = verification
         return verification
 
+    def _record_coding_outcome(self, *, applied: bool, target: str, details: str) -> None:
+        """Persist coding patch outcomes into Memory so Auronix learns from applied/rejected patches."""
+        if self.memory is None:
+            return
+        try:
+            if hasattr(self.memory, "save_coding_outcome"):
+                self.memory.save_coding_outcome(target, details, approved=applied)
+            elif hasattr(self.memory, "remember_lesson"):
+                verb = "Applied patch for" if applied else "Rejected patch for"
+                self.memory.remember_lesson(f"{verb} {target}", details)
+            elif hasattr(self.memory, "remember_fact"):
+                verb = "Applied patch for" if applied else "Rejected patch for"
+                self.memory.remember_fact(f"coding:{target[:40]}", f"{verb} {target}: {details}")
+        except Exception as exc:
+            self.logger.error(f"Failed recording coding outcome to memory: {exc}")
+
     def review_proposed_patch(self, patch: dict) -> dict:
         """Run CodeReviewer against original and patched file content before execution."""
         if not patch or patch.get("blocked") or patch.get("error"):
             review = {"approved": False, "reason": patch.get("error") or "Invalid patch."}
             self.last_review = review
+            self.logger.warn(f"Review aborted for invalid patch: {review['reason']}")
             return review
 
         target_rel = str(patch.get("file", ""))
@@ -456,6 +476,7 @@ class SelfCoder:
         if not allowed or target_abs is None:
             review = {"approved": False, "reason": info}
             self.last_review = review
+            self.logger.warn(f"Review blocked target {target_rel!r}: {info}")
             return review
 
         original_text = target_abs.read_text(encoding="utf-8")
@@ -472,9 +493,15 @@ class SelfCoder:
             str(patch.get("issue", "")),
         )
         self.last_review = review
+        target_label = str(patch.get("issue") or info)
         if review.get("approved"):
             patch["_reviewed_approved"] = True
             patch["review"] = review
+            self.logger.info(f"Reviewer approved patch for {info}: {review.get('reason', '')}")
+        else:
+            reason = str(review.get("reason", "rejected"))
+            self.logger.warn(f"Reviewer rejected patch for {info}: {reason}")
+            self._record_coding_outcome(applied=False, target=target_label, details=reason)
         return review
 
     def apply_fix(self, patch: dict, risk_level: str = "MEDIUM") -> bool:
@@ -485,11 +512,13 @@ class SelfCoder:
         target_rel = str(patch.get("file", ""))
         allowed, target_abs, rel_posix = self.validate_target_path(target_rel)
         if not allowed or target_abs is None:
+            self.logger.warn(f"Blocked forbidden patch target: {rel_posix}")
             print(f"[self_coder] blocked forbidden patch target: {rel_posix}")
             return False
 
         decision = self.evaluate_policy(rel_posix, risk_level, approved=True)
         if decision.outcome == PolicyOutcome.BLOCK:
+            self.logger.warn(f"Policy blocked patch for {rel_posix}: {decision.reason}")
             print(f"[self_coder] policy blocked patch for {rel_posix}: {decision.reason}")
             return False
 
@@ -500,6 +529,7 @@ class SelfCoder:
 
         current_text = target_abs.read_text(encoding="utf-8")
         if old_code not in current_text:
+            self.logger.warn(f"old_code no longer matches {rel_posix}")
             print(f"[self_coder] old_code no longer matches {rel_posix}")
             return False
 
@@ -509,6 +539,9 @@ class SelfCoder:
         backup_path = self.backup_dir / f"{stamp}_{target_abs.name}.bak"
         shutil.copy2(target_abs, backup_path)
         self.last_backup_path = backup_path
+        self.logger.info(f"Created pre-patch snapshot for {rel_posix} at {backup_path}")
+
+        target_label = str(patch.get("issue") or rel_posix)
 
         # 2. CodeReviewer check (unless already reviewed & approved in this pipeline pass)
         updated_text = current_text.replace(old_code, new_code, 1)
@@ -517,9 +550,12 @@ class SelfCoder:
             self.last_review = review
             if not review.get("approved", False):
                 shutil.copy2(backup_path, target_abs)
+                reason = str(review.get("reason", "rejected"))
+                self.logger.warn(f"Reviewer rejected patch for {rel_posix}: {reason}; restored {backup_path}")
+                self._record_coding_outcome(applied=False, target=target_label, details=reason)
                 print(
                     f"[self_coder] reviewer rejected patch for {rel_posix}: "
-                    f"{review.get('reason', 'rejected')}; restored backup from {backup_path}."
+                    f"{reason}; restored backup from {backup_path}."
                 )
                 return False
 
@@ -538,10 +574,16 @@ class SelfCoder:
         if not verification.passed or test_res.returncode != 0:
             # 5. Restore exact pre-patch snapshot without git reset
             shutil.copy2(backup_path, target_abs)
+            self.logger.error(f"Verification/pytest failed for {rel_posix}; restored backup from {backup_path}")
+            self._record_coding_outcome(
+                applied=False,
+                target=target_label,
+                details=f"Tests failed on {rel_posix} (exit {test_res.returncode}); restored backup.",
+            )
             print(f"[self_coder] tests failed after patching {rel_posix}; restored backup from {backup_path}.")
             return False
 
-        # 6. Log successful verified self-update
+        # 6. Log successful verified self-update and persist learning outcome
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         entry = (
             f"[{datetime.datetime.now().isoformat()}] "
@@ -555,6 +597,12 @@ class SelfCoder:
         )
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(entry)
+        self.logger.info(f"Applied verified {risk_level} patch to {rel_posix} ({verification.verification_id})")
+        self._record_coding_outcome(
+            applied=True,
+            target=target_label,
+            details=str(patch.get("explanation") or f"Updated {rel_posix} and verified with pytest."),
+        )
         return True
 
     def run_pipeline(self, issue_description: str, *, auto_apply: bool = True) -> dict:

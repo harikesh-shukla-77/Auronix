@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -18,6 +18,7 @@ from auronix.memory.store import (
 from .. import config
 
 _FACT_PREFIX = "fact:"
+_RESEARCH_PREFIX = "research:"
 _CTX_PREFIX = "session_ctx:"
 
 
@@ -268,6 +269,131 @@ class Memory:
     def search_memory(self, query: str, limit: int = 10) -> list[MemoryEntry]:
         """Search structured memory across conversations, facts, decisions, and lessons."""
         return self.store.search(query, limit=limit)
+
+    def save_research(
+        self,
+        query: str,
+        summary: str,
+        sources: list[dict] | None = None,
+    ) -> MemoryEntry | None:
+        """Persist a completed research summary and source URLs into SQLiteMemoryStore."""
+        clean_query = str(query or "").strip()
+        clean_summary = str(summary or "").strip()
+        if not clean_query or not clean_summary:
+            return None
+        source_urls = [str(s.get("url") or "").strip() for s in (sources or []) if isinstance(s, dict) and s.get("url")]
+        content = clean_summary
+        if source_urls and "http" not in clean_summary:
+            content = f"{clean_summary} Links: {', '.join(source_urls[:5])}"
+        try:
+            return self.store.add(
+                kind=MemoryKind.SUMMARY,
+                provenance=MemoryProvenance.TOOL,
+                title=f"{_RESEARCH_PREFIX}{clean_query}"[:200],
+                content=content[: self.store.max_content_chars],
+                confidence=0.85,
+                tags=("research", "skill:research"),
+            )
+        except ValueError:
+            return None
+
+    def last_research(self) -> MemoryEntry | None:
+        """Return the most recent saved research entry from SQLiteMemoryStore."""
+        entries = self.store.list_entries(kind=MemoryKind.SUMMARY, limit=self.store.max_entries)
+        research_entries = [
+            e for e in entries if "research" in e.tags or e.title.startswith(_RESEARCH_PREFIX)
+        ]
+        if not research_entries:
+            return None
+        research_entries.sort(key=lambda e: (e.updated_at, e.created_at, e.memory_id))
+        return research_entries[-1]
+
+    def save_coding_outcome(
+        self,
+        target: str,
+        details: str,
+        *,
+        approved: bool,
+    ) -> MemoryEntry | None:
+        """Record applied or rejected self-coding outcomes as durable lessons in SQLiteMemoryStore."""
+        verb = "Applied patch for" if approved else "Rejected patch for"
+        clean_target = str(target or "unknown").strip()
+        title = f"{verb} {clean_target}"[:200]
+        content = f"{verb} {clean_target}: {str(details or '').strip()}"[: self.store.max_content_chars]
+        try:
+            return self.remember_lesson(
+                title=title,
+                content=content,
+                provenance=MemoryProvenance.REVIEWER,
+                tags=("coding", "self_coder", "applied" if approved else "rejected"),
+                confidence=0.9 if approved else 0.95,
+            )
+        except ValueError:
+            return None
+
+    def recall_memory(self, query_text: str) -> str:
+        """Answer voice memory queries ('last thing we researched', 'yesterday', topic search)."""
+        lower = (query_text or "").lower().strip()
+
+        if "research" in lower or "researched" in lower:
+            entry = self.last_research()
+            if entry is None:
+                return "I haven't saved any research topics yet."
+            topic = (
+                entry.title[len(_RESEARCH_PREFIX) :]
+                if entry.title.startswith(_RESEARCH_PREFIX)
+                else entry.title
+            )
+            return f"The last thing we researched was {topic}. {entry.content}"
+
+        if "yesterday" in lower or "worked on" in lower:
+            entries = self.store.list_entries(limit=self.store.max_entries)
+            if "yesterday" in lower:
+                y_local = (datetime.now() - timedelta(days=1)).date().isoformat()
+                y_utc = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+                target_dates = {y_local, y_utc}
+                matched = [
+                    e
+                    for e in entries
+                    if (e.created_at[:10] in target_dates or e.updated_at[:10] in target_dates)
+                    and "session_state" not in e.tags
+                ]
+                prefix = "Yesterday we worked on:"
+                empty_msg = "I don't see anything recorded from yesterday."
+            else:
+                matched = [e for e in entries if "session_state" not in e.tags]
+                prefix = "Recently we worked on:"
+                empty_msg = "I don't have any recorded work in memory yet."
+
+            if not matched:
+                return empty_msg
+            # Prefer lessons/coding/research summaries before generic chat turns
+            prioritized = sorted(
+                matched,
+                key=lambda e: (
+                    0 if ("coding" in e.tags or "research" in e.tags) else 1,
+                    e.updated_at,
+                ),
+            )
+            # Re-sort newest first inside priority bucket
+            non_chat = [e for e in prioritized if "chat" not in e.tags]
+            chosen = (non_chat or matched)[:3]
+            snippets = [f"{e.title}: {e.content[:140]}" for e in chosen]
+            return f"{prefix} {'; '.join(snippets)}."
+
+        # General topic lookup
+        cleaned_topic = (
+            lower.replace("search memory for", "")
+            .replace("search memory", "")
+            .replace("what do you remember about", "")
+            .strip(" .?!")
+        )
+        if not cleaned_topic:
+            return "What topic would you like me to recall from memory?"
+        hits = self.search_memory(cleaned_topic, limit=3)
+        if not hits:
+            return f"I couldn't find anything about {cleaned_topic} in memory."
+        return "From memory: " + "; ".join(f"{h.title} ({h.content[:120]})" for h in hits) + "."
 
     def add_reminder(self, task: str, trigger_at_iso: str):
         with sqlite3.connect(self.db_path) as conn:

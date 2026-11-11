@@ -19,6 +19,7 @@ SAMPLE_RATE = 16000
 AURONIX_HOME = Path.home() / ".auronix"
 AURONIX_HOME.mkdir(exist_ok=True)
 DB_PATH = AURONIX_HOME / "auronix.db"
+LOG_PATH = AURONIX_HOME / "auronix.log"
 
 MAX_AUDIO_SECONDS = 10
 SILENCE_RMS_THRESHOLD = 0.012

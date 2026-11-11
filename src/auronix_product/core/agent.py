@@ -16,6 +16,7 @@ from ..briefing import BriefingBuilder
 from ..brain.client import LLM, LLMError, is_refusal
 from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.context_tracker import ConversationContext
+from ..core.logger import get_logger
 from ..core.memory import Memory
 from ..voice import sfx
 from ..voice.audio_guard import is_barge_in_command, should_discard_transcript
@@ -75,6 +76,13 @@ _REASONING_RE = _re.compile(
     _re.IGNORECASE,
 )
 
+_MEMORY_QUERY_RE = _re.compile(
+    r"(?:\bwhat did we work on\b|\byesterday\b.*\bwork|\blast thing we researched\b|"
+    r"\blast research\b|\bwhat did we research\b|\bsearch memory\b|"
+    r"\bwhat do you remember about\b)",
+    _re.IGNORECASE,
+)
+
 YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "ok", "okay", "kar do", "karo", "confirm", "sure", "proceed"}
 NO_WORDS = {"no", "nahi", "nah", "cancel", "stop", "mat karo", "band"}
 KNOWN_SINGLE_WORDS = {
@@ -98,6 +106,7 @@ class PendingIntent:
 
 class Agent:
     def __init__(self):
+        self.logger = get_logger("auronix.agent")
         self.memory = Memory()
         self.stt = STT()
         self.tts = TTS(config.KOKORO_VOICE)
@@ -111,6 +120,7 @@ class Agent:
                 threshold=config.WAKE_THRESHOLD,
             )
         except Exception as e:
+            self.logger.warn(f"WakeWordDetector unavailable ({e}); falling back to {HOTKEY_DISPLAY}.")
             print(f"[wake] WakeWordDetector unavailable ({e}); falling back to {HOTKEY_DISPLAY}.")
         self.scheduler = ReminderScheduler(self.memory, self.tts)
         self.briefing = BriefingBuilder(memory=self.memory)
@@ -127,12 +137,14 @@ class Agent:
             llm=self.llm,
             timeout=60,
             model_name=config.OLLAMA_DOLPHIN_MODEL,
+            memory=self.memory,
         )
         self.self_coder = SelfCoder(
             llm=self.llm,
             coder_model=config.OLLAMA_DOLPHIN_MODEL,
             memory=self.memory,
         )
+        self.logger.info("Auronix Agent initialized (Stage 6 unified memory & logging active)")
         self.menubar = None
         self.set_menubar_state = lambda _state: None
         self.continuous_mode = False
@@ -280,9 +292,17 @@ class Agent:
             return f"High-risk change in {fname}:\n{diff_preview}\nProceed with applying this fix?"
         return f"I want to modify {fname}. Proceed?"
 
+    def _handle_memory_query(self, query_text: str) -> str:
+        """Query persistent SQLiteMemoryStore for yesterday's work, last research, or memory hits."""
+        self.logger.info(f"Handling voice memory query: {query_text!r}")
+        if hasattr(self.memory, "recall_memory"):
+            return _strip_emoji(self.memory.recall_memory(query_text))
+        return "Memory search is unavailable right now."
+
     def _run_research(self, query: str, announce: bool = True) -> str:
         """Announce research start, run multi-site ResearchSkill, and return cited summary."""
         progress = f"Researching {query} across multiple sites..."
+        self.logger.info(f"Dispatching ResearchSkill: {progress}")
         print(f"[research] {progress}")
         if announce:
             self.set_menubar_state("speaking")
@@ -441,6 +461,7 @@ class Agent:
             return True, self._run_research(query, announce=not text_mode)
 
         if routed is not None:
+            self.logger.info(f"quick_route handled command -> {routed.response[:80]!r}")
             print(f"[quick_route] {routed.response[:80]}")
             if getattr(routed, "pending_intent", None):
                 self.pending_intent = PendingIntent(routed.pending_intent)
@@ -452,6 +473,12 @@ class Agent:
                 sfx.play_success()
                 notify_result("Auronix", routed.response[:160])
             return True, _strip_emoji(routed.response)
+
+        if _MEMORY_QUERY_RE.search(text):
+            res = self._handle_memory_query(text)
+            sfx.play_success()
+            notify_result("Auronix Memory", res[:160])
+            return True, res
 
         return False, ""
 
@@ -609,6 +636,7 @@ class Agent:
 
     def _execute_and_reply(self, user_text: str, text_mode: bool, is_split: bool = False) -> None:
         """Process one user utterance, persist the turn, and speak in voice mode."""
+        self.logger.info(f"User utterance (text_mode={text_mode}): {user_text!r}")
         print(f"You: {user_text}")
         self.set_menubar_state("thinking")
         t_proc = time.perf_counter()

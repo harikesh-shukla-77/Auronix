@@ -11,3 +11,6 @@ dist/
 .coverage
 htmlcov/
 
+.env
+__pycache__/
+.DS_Store

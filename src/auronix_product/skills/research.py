@@ -12,6 +12,7 @@ import httpx
 
 from .. import config
 from ..brain.client import LLM
+from ..core.logger import get_logger
 
 
 def _unwrap_ddg_url(href: str) -> str:
@@ -70,12 +71,16 @@ class ResearchSkill:
         use_peruse: bool = False,
         vlm_model: str = "minicpm-v",
         model_name: str = config.OLLAMA_DOLPHIN_MODEL,
+        memory=None,
+        logger=None,
     ):
         self.llm = llm or LLM()
         self.timeout = int(timeout)
         self.use_peruse = use_peruse
         self.vlm_model = vlm_model
         self.model_name = model_name
+        self.memory = memory
+        self.logger = logger or get_logger("auronix.research")
 
     def _run_peruse_agent(self, query: str, deadline: float) -> dict | None:
         """Optional PeruseAgent autonomous vision-browsing path capped cleanly within deadline."""
@@ -279,6 +284,7 @@ class ResearchSkill:
         max_sites = max(1, min(5, int(max_sites)))
         start_t = time.monotonic()
         deadline = start_t + self.timeout
+        self.logger.info(f"Starting research for query={clean_query!r} (max_sites={max_sites})")
 
         sources: list[dict] = []
         mode = "playwright"
@@ -291,6 +297,7 @@ class ResearchSkill:
                     if p_res:
                         return "peruse_ai", p_res["sources"], p_res["summary"]
                 except Exception as e:
+                    self.logger.warn(f"Peruse-AI fallback to Playwright: {e}")
                     print(f"[research] peruse_ai fallback to playwright: {e}")
             pages = self._browse_with_playwright(clean_query, max_sites, deadline)
             return "playwright", pages, None
@@ -300,9 +307,11 @@ class ResearchSkill:
                 fut = pool.submit(_worker)
                 mode, sources, peruse_summary = fut.result(timeout=self.timeout)
         except FutureTimeout:
+            self.logger.warn(f"Browser research timed out after {self.timeout}s for {clean_query!r}; using DuckDuckGo fallback")
             print(f"[research] browser research timed out after {self.timeout}s; falling back to DuckDuckGo")
             sources = []
         except Exception as e:
+            self.logger.warn(f"Browser research failed ({e}) for {clean_query!r}; using DuckDuckGo fallback")
             print(f"[research] browser research failed ({e}); falling back to DuckDuckGo")
             sources = []
 
@@ -314,11 +323,26 @@ class ResearchSkill:
                 sources = self._fallback_duckduckgo(clean_query, max_sites=max_sites)
             summary = self._summarize_with_citations(clean_query, sources)
 
-        return {
+        result = {
             "query": clean_query,
             "summary": summary,
             "sources": [{"title": s["title"], "url": s["url"]} for s in sources],
             "mode": mode,
             "elapsed_seconds": round(time.monotonic() - start_t, 2),
         }
+
+        if self.memory is not None:
+            try:
+                if hasattr(self.memory, "save_research"):
+                    self.memory.save_research(clean_query, summary, result["sources"])
+                elif hasattr(self.memory, "remember_fact"):
+                    self.memory.remember_fact(f"research:{clean_query[:60]}", summary)
+                self.logger.info(f"Saved research findings for {clean_query!r} to SQLite memory")
+            except Exception as exc:
+                self.logger.error(f"Failed saving research to memory: {exc}")
+
+        self.logger.info(
+            f"Completed research for {clean_query!r} via {mode} ({len(result['sources'])} sources, {result['elapsed_seconds']}s)"
+        )
+        return result
 
