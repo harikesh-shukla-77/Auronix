@@ -22,7 +22,7 @@ from .patterns import (
     _REMINDER_PATTERNS, _REMIND_IN_PATTERNS, _REMIND_AT_PATTERNS,
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
     _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
-    _CALENDAR_PATTERNS,
+    _CALENDAR_PATTERNS, _RESEARCH_PATTERNS, _SELF_FIX_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
@@ -123,6 +123,19 @@ def execute_search(query: str) -> str:
     return search_web(clean)
 
 
+_APP_ALIASES = {
+    "chrome": "Google Chrome",
+    "vs code": "Visual Studio Code",
+    "vscode": "Visual Studio Code",
+}
+
+
+def _resolve_app_name(name: str) -> str:
+    cleaned = _clean_app_name(name)
+    key = cleaned.lower().strip()
+    return _APP_ALIASES.get(key, cleaned.title())
+
+
 def execute_open(target: str) -> str:
     """Execute app or URL launch for a pending open_app intent."""
     clean = target.strip().rstrip(".!?, ")
@@ -130,8 +143,7 @@ def execute_open(target: str) -> str:
         return "Which app would you like me to open?"
     if re.match(r"^(?:https?://[^\s]+|[a-zA-Z0-9.-]+\.(?:com|org|net|in|io|co|ai|dev|edu|gov)(?:/[^\s]*)?)$", clean):
         return open_url(clean)
-    app_name = _clean_app_name(clean).title()
-    return open_app(app_name)
+    return open_app(_resolve_app_name(clean))
 
 
 class RoutedCommand:
@@ -183,11 +195,33 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
                     break
         return RoutedCommand(copy_to_clipboard(last_assistant))
 
-    if lower in ("search", "google", "search web", "web search", "khojo"):
+    if any(re.search(pat, lower) for pat in _SELF_FIX_PATTERNS):
+        return RoutedCommand(
+            "What issue should I fix? Please describe the bug.",
+            pending_intent="code_fix",
+        )
+
+    if lower in ("research", "research karo", "search and summarize"):
+        return RoutedCommand("Sure, what would you like me to research?", pending_intent="research")
+
+    for pat in _RESEARCH_PATTERNS:
+        m = re.search(pat, lower)
+        if m:
+            topic = m.group(1).strip().rstrip(".!?, ")
+            if topic:
+                return RoutedCommand(f"__RESEARCH__:{topic}")
+
+    if lower in ("search", "search karo", "google", "google karo", "search web", "web search", "khojo"):
         return RoutedCommand("Sure, what would you like to search for?", pending_intent="search")
 
     if lower in ("open", "launch", "open app", "kholo"):
         return RoutedCommand("Which app would you like me to open?", pending_intent="open_app")
+
+    if re.fullmatch(
+        r"(?:(?:okay|ok|hey|please|auronix)[,\s]+)*(?:band karo|ruk ja|ruk jao|chup|stop)(?:[,\s]+please)?",
+        lower,
+    ):
+        return RoutedCommand("Stopped.")
 
     # 1. NAME SAVE / RECALL
     for pat in _SAVE_NAME_PATTERNS:
@@ -317,6 +351,12 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             if query:
                 return RoutedCommand(search_web(query))
 
+    suffix_search = re.match(r"^(.+?)\s+(?:search karo|google karo|khojo)$", lower)
+    if suffix_search:
+        query = suffix_search.group(1).strip()
+        if query:
+            return RoutedCommand(execute_search(query))
+
     # TIME
     if any(re.search(pat, lower) for pat in _TIME_PATTERNS):
         return RoutedCommand(get_current_time())
@@ -394,7 +434,18 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             sort_by = "size" if "bade" in lower or "big" in lower else "name"
             return RoutedCommand(list_files(folder, sort_by=sort_by))
 
-    # OPEN APP (L2)
+    # OPEN APP (L2) — supports English prefix ("open Safari") & Hinglish suffix ("Safari kholo", "Chrome chalu karo")
+    hinglish_open = re.match(
+        r"^([A-Za-z][A-Za-z0-9 ._-]{0,25}?)\s+(?:kholo|khol\s+do|chalu\s+karo|launch\s+karo|open\s+karo)$",
+        lower,
+    )
+    if hinglish_open:
+        raw_app = _clean_app_name(hinglish_open.group(1))
+        if raw_app and len(raw_app) > 1 and raw_app.lower() not in (
+            "in browser", "the browser", "browser", "a browser", "new tab", "tab", "listening",
+        ):
+            return RoutedCommand(open_app(_resolve_app_name(raw_app)))
+
     for pat in _OPEN_PATTERNS:
         m = re.search(pat, lower)
         if m:
@@ -403,7 +454,7 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
                 # Ignore generic browser requests
                 if app.lower() in ("in browser", "the browser", "browser", "a browser", "new tab"):
                     return None
-                return RoutedCommand(open_app(app.title()))
+                return RoutedCommand(open_app(_resolve_app_name(app)))
 
     return None
 

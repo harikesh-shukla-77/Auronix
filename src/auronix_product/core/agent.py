@@ -3,14 +3,16 @@
 from __future__ import annotations
 import json
 import os
+from pathlib import Path
 import re as _re
 import subprocess
 import sys
 import threading
 import time
+import numpy as np
 from .. import config
 from ..briefing import BriefingBuilder
-from ..brain.client import LLM, LLMError
+from ..brain.client import LLM, LLMError, is_refusal
 from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.context_tracker import ConversationContext
 from ..core.memory import Memory
@@ -26,6 +28,7 @@ from ..actions.handlers import open_app, search_web
 from ..actions.router import copy_to_clipboard, execute_open, execute_search, quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
+from ..skills import ResearchSkill, SelfCoder
 
 _EMOJI_RE = _re.compile(EMOJI_RE_PATTERN, flags=_re.UNICODE)
 
@@ -65,12 +68,13 @@ _TOOL_INTENT_RE = _re.compile(
     _re.IGNORECASE,
 )
 
-YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "ok", "okay", "kar do", "karo", "confirm", "sure"}
+YES_WORDS = {"yes", "yeah", "yep", "haan", "ha", "ok", "okay", "kar do", "karo", "confirm", "sure", "proceed"}
 NO_WORDS = {"no", "nahi", "nah", "cancel", "stop", "mat karo", "band"}
 KNOWN_SINGLE_WORDS = {
     "stop", "pause", "resume", "yes", "no", "help", "status",
-    "search", "open", "undo", "time", "weather", "cancel", "quiet",
+    "search", "open", "research", "undo", "time", "weather", "cancel", "quiet",
     "chup", "band", "ruko", "bas", "haan", "ok", "okay", "nahi",
+    "proceed", "sure", "confirm",
 }
 
 
@@ -104,6 +108,15 @@ class Agent:
         self.scheduler = ReminderScheduler(self.memory, self.tts)
         self.briefing = BriefingBuilder(memory=self.memory)
         self.conv_ctx = ConversationContext(max_turns=10)
+        self.research_skill = ResearchSkill(
+            llm=self.llm,
+            timeout=60,
+            model_name=config.OLLAMA_DOLPHIN_MODEL,
+        )
+        self.self_coder = SelfCoder(
+            llm=self.llm,
+            coder_model=config.OLLAMA_DOLPHIN_MODEL,
+        )
         self.menubar = None
         self.set_menubar_state = lambda _state: None
         self.continuous_mode = False
@@ -114,7 +127,11 @@ class Agent:
 
     def _chime(self):
         try:
-            subprocess.run(["afplay", CHIME], check=False)
+            subprocess.Popen(
+                ["afplay", CHIME],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception:
             pass
 
@@ -140,10 +157,24 @@ class Agent:
             else self.llm.model
         )
         for _ in range(MAX_TOOL_ROUNDS):
-            result = self.llm.chat(messages, tools=TOOLS, model=tool_model)
+            call_tools = TOOLS if "dolphin" not in (tool_model or "").lower() else None
+            try:
+                result = self.llm.chat(messages, tools=call_tools, model=tool_model)
+            except LLMError:
+                if tool_model == config.OLLAMA_DOLPHIN_MODEL:
+                    raise
+                print(f"[llm] {tool_model} failed; falling back to {config.OLLAMA_DOLPHIN_MODEL}")
+                result = self.llm.chat(messages, model=config.OLLAMA_DOLPHIN_MODEL)
+                return _strip_emoji(result.get("content", ""))
+
             tool_calls = result.get("tool_calls")
             if not tool_calls:
-                return _strip_emoji(result.get("content", ""))
+                content = result.get("content", "")
+                if (is_refusal(content) or not content) and tool_model != config.OLLAMA_DOLPHIN_MODEL:
+                    print(f"[llm] {tool_model} refused/empty; falling back to {config.OLLAMA_DOLPHIN_MODEL}")
+                    fb = self.llm.chat(messages, model=config.OLLAMA_DOLPHIN_MODEL)
+                    return _strip_emoji(fb.get("content", ""))
+                return _strip_emoji(content)
             messages.append({
                 "role": "assistant",
                 "content": result.get("content", ""),
@@ -188,16 +219,58 @@ class Agent:
                 return True
         return True
 
-    def _try_fast_path(self, text: str) -> tuple[bool, str]:
+    def _apply_code_patch(self, patch: dict, risk: str) -> str:
+        """Apply a proposed code patch via SelfCoder and report pass or git rollback."""
+        fname = Path(str(patch.get("file", ""))).name or "file"
+        if self.self_coder.apply_fix(patch, risk):
+            return f"Applied {risk.lower()}-risk fix to {fname}. All tests passed."
+        return f"Tests failed after updating {fname}; rolled back cleanly with git reset."
+
+    def _handle_code_fix_issue(self, issue_description: str) -> str:
+        """Propose a fix and enforce LOW/MEDIUM/HIGH safety gates."""
+        patch = self.self_coder.propose_fix(issue_description)
+        if patch.get("blocked") or patch.get("error"):
+            return f"Cannot modify code: {patch.get('error', 'safety policy violation.')}"
+
+        risk = patch.get("risk_level", "HIGH")
+        fname = Path(patch["file"]).name
+        if risk == "LOW":
+            return self._apply_code_patch(patch, "LOW")
+
+        self._pending_confirm = lambda: self._apply_code_patch(patch, risk)
+        self._pending_desc = f"apply {risk.lower()}-risk fix to {fname}"
+        if risk == "HIGH":
+            diff_preview = (patch.get("diff") or "")[:1200]
+            return f"High-risk change in {fname}:\n{diff_preview}\nProceed with applying this fix?"
+        return f"I want to modify {fname}. Proceed?"
+
+    def _run_research(self, query: str, announce: bool = True) -> str:
+        """Announce research start, run multi-site ResearchSkill, and return cited summary."""
+        progress = f"Researching {query} across multiple sites..."
+        print(f"[research] {progress}")
+        if announce:
+            self.set_menubar_state("speaking")
+            self.tts.speak_async(progress)
+        result = self.research_skill.research(query, max_sites=3)
+        summary = _strip_emoji(result.get("summary", "")) or "Done."
+        sfx.play_success()
+        notify_result("Auronix Research", summary[:160])
+        return summary
+
+    def _try_fast_path(self, text: str, text_mode: bool = True) -> tuple[bool, str]:
         """Handle continuous mode, confirmations, model switching, memory resets, and quick_route."""
         lower_clean = text.lower().strip().rstrip(".!?, ")
 
-        # START CONTINUOUS MODE
+        # START CONTINUOUS MODE (don't swallow "<App> chalu karo")
         start_phrases = (
             "start listening", "continuous mode", "always listen",
-            "sunte raho", "chalu karo", "sunna shuru karo", "start continuous",
+            "sunte raho", "sunna shuru karo", "start continuous",
         )
-        if any(phrase in lower_clean for phrase in start_phrases):
+        if any(phrase in lower_clean for phrase in start_phrases) or lower_clean in (
+            "chalu karo",
+            "listening chalu karo",
+            "continuous mode chalu karo",
+        ):
             self.continuous_mode = True
             return True, "Continuous mode on. I'm listening. Say stop or band karo to exit."
 
@@ -273,6 +346,12 @@ class Agent:
                     sfx.play_success()
                     notify_result("Auronix", res[:160])
                     return True, res
+                if self.pending_intent.type == "research":
+                    self.pending_intent = None
+                    return True, self._run_research(text.strip(), announce=not text_mode)
+                if self.pending_intent.type == "code_fix":
+                    self.pending_intent = None
+                    return True, self._handle_code_fix_issue(text.strip())
 
         # Explicit user confirmation for proposed AppleScript fix
         if lower_clean == "run fix":
@@ -320,6 +399,10 @@ class Agent:
             sfx.play_success()
             notify_result("Auronix", res[:160])
             return True, res
+
+        if routed is not None and routed.response.startswith("__RESEARCH__:"):
+            query = routed.response.split(":", 1)[1].strip()
+            return True, self._run_research(query, announce=not text_mode)
 
         if routed is not None:
             print(f"[quick_route] {routed.response[:80]}")
@@ -389,6 +472,24 @@ class Agent:
                 print(f"[timing] llm_response: {(time.perf_counter() - t_llm) * 1000:.0f}ms")
 
         barge_in_interrupted = threading.Event()
+        used_dolphin_fallback = False
+
+        def _speak_nonstreamed(msg: str) -> None:
+            if not text_mode and msg:
+                self.set_menubar_state("speaking")
+                self.tts.speak_async(msg)
+                if self.continuous_mode or is_split:
+                    time.sleep(min(15.0, (len(msg) * 0.08) + 2.5))
+
+        def _fallback_to_dolphin(reason: str) -> str:
+            nonlocal used_dolphin_fallback
+            used_dolphin_fallback = True
+            print(f"[llm] {self.llm.model} {reason}; falling back to {config.OLLAMA_DOLPHIN_MODEL}")
+            fb_res = self.llm.chat(messages, model=config.OLLAMA_DOLPHIN_MODEL)
+            fb_text = _strip_emoji(fb_res.get("content", "")) or "Done."
+            _speak_nonstreamed(fb_text)
+            return fb_text
+
         try:
             if not text_mode:
                 self.set_menubar_state("speaking")
@@ -424,17 +525,27 @@ class Agent:
                     )
             else:
                 response = "".join(_clean_chunks()).strip()
+
+            if (
+                (is_refusal(response) or not response.strip())
+                and self.llm.model != config.OLLAMA_DOLPHIN_MODEL
+                and not barge_in_interrupted.is_set()
+            ):
+                response = _fallback_to_dolphin("refused/empty")
         except LLMError as e:
-            print(f"[llm error] {e}")
-            sfx.play_error()
-            self.set_menubar_state("error")
-            notify_alert("Auronix Error", str(e))
-            response = "I couldn't reach the language model."
-            if not text_mode:
-                self.set_menubar_state("speaking")
-                self.tts.speak_async(response)
-                if self.continuous_mode or is_split:
-                    time.sleep(min(15.0, (len(response) * 0.08) + 2.5))
+            if self.llm.model != config.OLLAMA_DOLPHIN_MODEL and not used_dolphin_fallback:
+                try:
+                    response = _fallback_to_dolphin("stream failed")
+                    e = None
+                except LLMError as fb_err:
+                    e = fb_err
+            if e is not None:
+                print(f"[llm error] {e}")
+                sfx.play_error()
+                self.set_menubar_state("error")
+                notify_alert("Auronix Error", str(e))
+                response = "I couldn't reach the language model."
+                _speak_nonstreamed(response)
 
         response = _strip_emoji(response) or "Done."
         print(f"Auronix: {response}")
@@ -451,7 +562,7 @@ class Agent:
         self.set_menubar_state("thinking")
         t_proc = time.perf_counter()
         if getattr(self._process, "__func__", None) is Agent._process:
-            handled, response = self._try_fast_path(user_text)
+            handled, response = self._try_fast_path(user_text, text_mode=text_mode)
             if not handled:
                 if _TOOL_INTENT_RE.search(user_text) or self.llm.model == config.OLLAMA_SMART_MODEL:
                     messages = self._build_messages(user_text)
@@ -545,12 +656,15 @@ class Agent:
                     if not text or text.lower() == "exit":
                         break
                 else:
+                    pre_audio = None
                     if not self.continuous_mode:
                         self.set_menubar_state("idle")
                         if self.wake_detector is not None:
                             print("Waiting for wake word 'Auronix'...")
                             if not self.wake_detector.wait_for_wake():
                                 break
+                            if hasattr(self.wake_detector, "consume_rolling_buffer"):
+                                pre_audio = self.wake_detector.consume_rolling_buffer()
                         else:
                             print(f"\n[{current}] Waiting for {HOTKEY_DISPLAY}... (or say 'start listening')")
                             if not self.hotkey.wait():
@@ -578,10 +692,23 @@ class Agent:
                         audio = self.stt.record()
                     except KeyboardInterrupt:
                         continue
+                    if pre_audio is not None and len(pre_audio) > 0:
+                        if audio is not None and len(audio) > 0:
+                            audio = np.concatenate([pre_audio, audio])
+                        else:
+                            audio = pre_audio
                     if len(audio) < 3200:
                         continue
                     self.set_menubar_state("thinking")
                     text = self.stt.transcribe(audio).strip()
+                    has_active_intent = self.pending_intent is not None and not self.pending_intent.expired()
+                    if not has_active_intent:
+                        text = _re.sub(
+                            r"^(?:hey\s+)?(?:auronix|aaronix|ironix)[,.\s]*",
+                            "",
+                            text,
+                            flags=_re.IGNORECASE,
+                        ).strip()
                     last_tts = (
                         getattr(self.tts, "last_spoken_text", "")
                         or getattr(self.conv_ctx, "last_response", "")
@@ -606,7 +733,6 @@ class Agent:
                             continue
 
                     # Reject isolated single-word hallucinations unless known command or awaiting pending intent
-                    has_active_intent = self.pending_intent is not None and not self.pending_intent.expired()
                     if (
                         len(words) == 1
                         and words[0].lower().rstrip(".,!?") not in KNOWN_SINGLE_WORDS

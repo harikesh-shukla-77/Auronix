@@ -20,6 +20,8 @@ dependencies = [
     "silero-vad>=4.0",
     "kokoro>=0.9.2",
     "sounddevice>=0.4.6",
+    "peruse-ai>=0.1.0",
+    "playwright>=1.50.0",
 ]
 
 [project.optional-dependencies]

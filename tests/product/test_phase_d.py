@@ -589,3 +589,99 @@ def test_silero_vad_gate_and_app_bundle_launchagent(monkeypatch):
     assert agent_cfg["KeepAlive"] == {"SuccessfulExit": False}
     assert "/Applications/Auronix.app" in agent_cfg["ProgramArguments"]
 
+
+def test_hinglish_routing_rolling_wake_buffer_and_ghost_warning(tmp_path, monkeypatch, capsys):
+    import auronix_product.__main__ as main_mod
+    import auronix_product.actions.router as router_mod
+    import auronix_product.core.agent as agent_mod
+    import auronix_product.voice.stt as stt_mod
+    from auronix_product.core.memory import Memory
+
+    # 1. Hinglish initial_prompt and router mappings
+    assert "kholo" in stt_mod.DOMAIN_PROMPT
+    assert "search karo" in stt_mod.DOMAIN_PROMPT
+    assert "ruk ja" in stt_mod.DOMAIN_PROMPT
+
+    mem = Memory(db_path=tmp_path / "hinglish.db")
+    opened_apps: list[str] = []
+    monkeypatch.setattr(router_mod, "open_app", lambda app: opened_apps.append(app) or f"Opened {app}.")
+    monkeypatch.setattr(
+        router_mod.briefing_system_status,
+        "get_system_status",
+        lambda: {"battery_percent": 74, "summary": "Battery is 74% (on battery), CPU 8%, RAM 55%."},
+    )
+
+    assert router_mod.quick_route("Safari kholo", mem).response == "Opened Safari."
+    assert router_mod.quick_route("Chrome chalu karo", mem).response == "Opened Google Chrome."
+    assert opened_apps == ["Safari", "Google Chrome"]
+    assert "74%" in router_mod.quick_route("Battery kitni hai", mem).response
+    assert router_mod.quick_route("Band karo", mem).response == "Stopped."
+    assert router_mod.quick_route("Ruk ja", mem).response == "Stopped."
+
+    search_cmd = router_mod.quick_route("Search karo", mem)
+    assert search_cmd.pending_intent == "search"
+
+    # Chrome chalu karo through Agent._process does NOT accidentally trigger continuous mode
+    monkeypatch.setattr(agent_mod, "Memory", lambda: mem)
+    agent = agent_mod.Agent()
+    assert agent._process("Chrome chalu karo") == "Opened Google Chrome."
+    assert agent.continuous_mode is False
+    assert "what would you like to search for" in agent._process("Search karo").lower()
+    assert agent.pending_intent is not None and agent.pending_intent.type == "search"
+    agent.pending_intent = None
+
+    # 2. WakeWordDetector maintains a 1.2s rolling buffer and Agent prepends it for one-shot commands
+    detector = agent.wake_detector
+    detector.reset()
+    chunk = np.ones(detector.chunk_samples, dtype=np.float32) * 0.01
+    for idx in range(20):  # 2.0s > 1.2s cap
+        detector.process_chunk(chunk * (idx + 1), now=idx * 0.1)
+    assert len(detector.get_rolling_buffer()) == int(1.2 * detector.sample_rate)
+
+    pre = np.full(19200, 0.25, dtype=np.float32)
+    tail = np.full(4000, 0.5, dtype=np.float32)
+    detector._triggered_buffer = pre.copy()
+
+    agent.stt.preload = MagicMock()
+    agent.tts.preload = MagicMock()
+    agent.tts.speak = MagicMock()
+    agent.tts.speak_async = MagicMock()
+    agent.llm.warmup = MagicMock()
+    agent._chime = MagicMock()
+    agent.briefing.should_deliver_today = MagicMock(return_value=False)
+    monkeypatch.setattr(agent_mod.sfx, "play_wake", MagicMock())
+    monkeypatch.setattr(agent_mod.sfx, "play_listening", MagicMock())
+    monkeypatch.setattr(agent_mod.sfx, "play_success", MagicMock())
+    monkeypatch.setattr(agent_mod, "notify_result", MagicMock())
+
+    agent.wake_detector.wait_for_wake = MagicMock(side_effect=[True, False])
+    agent.stt.record = MagicMock(return_value=tail)
+    seen_audio: list[np.ndarray] = []
+
+    def fake_transcribe(arr):
+        seen_audio.append(arr)
+        return "Auronix open safari"
+
+    agent.stt.transcribe = fake_transcribe
+    agent.run(text_mode=False)
+
+    assert len(seen_audio) == 1
+    assert len(seen_audio[0]) == len(pre) + len(tail)
+    assert seen_audio[0][0] == 0.25
+    assert seen_audio[0][-1] == 0.5
+    # Leading wake word stripped so "Opened Safari." executed
+    assert opened_apps[-1] == "Safari"
+
+    # 3. Manual terminal launch warns if com.auronix.assistant daemon is already running
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "run",
+        MagicMock(return_value=MagicMock(stdout="99999\t0\tcom.auronix.assistant\n", returncode=0)),
+    )
+    capsys.readouterr()
+    assert main_mod.warn_if_daemon_running(argv=[]) is True
+    err_out = capsys.readouterr().out
+    assert "launchctl unload" in err_out
+    assert main_mod.warn_if_daemon_running(argv=["--background"]) is False
+

@@ -118,12 +118,29 @@ class WakeWordDetector:
         self._above = 0
         self._last_trigger_time = -1e9
         self.last_detect_ms: float = 0.0
+        self._rolling_max_samples = int(1.2 * self.sample_rate)
+        self._rolling_buffer = np.array([], dtype=np.float32)
+        self._triggered_buffer = np.array([], dtype=np.float32)
 
     def reset(self) -> None:
         """Clear rolling buffer and filter state between wake cycles."""
         self._buffer.zero_()
         self._hpf.reset()
         self._above = 0
+        self._rolling_buffer = self._np.array([], dtype=self._np.float32)
+
+    def get_rolling_buffer(self):
+        """Return captured 1.2s rolling audio tail around the last wake trigger."""
+        if self._triggered_buffer.size > 0:
+            return self._triggered_buffer.copy()
+        return self._rolling_buffer[-self._rolling_max_samples:].copy()
+
+    def consume_rolling_buffer(self):
+        """Return and clear the captured 1.2s rolling wake buffer."""
+        buf = self.get_rolling_buffer()
+        self._rolling_buffer = self._np.array([], dtype=self._np.float32)
+        self._triggered_buffer = self._np.array([], dtype=self._np.float32)
+        return buf
 
     def process_chunk(self, audio_chunk, now: float | None = None) -> bool:
         """Process one float32 audio chunk and return True when the wake word triggers."""
@@ -137,6 +154,10 @@ class WakeWordDetector:
         chunk = self._np.asarray(audio_chunk, dtype=self._np.float32).flatten()
         if chunk.size == 0:
             return False
+
+        self._rolling_buffer = self._np.concatenate([self._rolling_buffer, chunk])[
+            -self._rolling_max_samples :
+        ]
 
         filt_new = self._hpf(self._torch.from_numpy(chunk))
         n = filt_new.numel()
@@ -167,6 +188,7 @@ class WakeWordDetector:
             and (now - self._last_trigger_time) > self.refractory_seconds
         ):
             self.last_detect_ms = (time.perf_counter() - t_chunk0) * 1000
+            self._triggered_buffer = self._rolling_buffer[-self._rolling_max_samples :].copy()
             self._last_trigger_time = now
             self._above = 0
             return True

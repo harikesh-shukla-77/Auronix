@@ -23,7 +23,7 @@ _DATE_PATTERNS = [
 ]
 
 _SYSTEM_PATTERNS = [
-    r"\b(battery|cpu|ram|memory|system).{0,15}(status|kitna|kaise|batao)\b",
+    r"\b(battery|cpu|ram|memory|system).{0,15}(status|kitna|kitni|kya|percent|kaise|batao)\b",
     r"\bhow.{0,10}(battery|cpu|ram|memory)\b",
 ]
 
@@ -160,5 +160,18 @@ _CALENDAR_PATTERNS = [
     r"\b(today|aaj).{0,10}(schedule|calendar|events|ka kya)",
     r"\b(learn today|learn's today)\b",  # STT error for "what's on today"
     r"\bis on today\b",  # STT error fragment
+]
+
+_RESEARCH_PATTERNS = [
+    r"^(?:please\s+)?research(?:\s+karo)?\s+(?:about\s+|on\s+|for\s+)?(.+)$",
+    r"^(.+?)\s+(?:ke\s+baare\s+mein\s+)?research(?:\s+karo)?$",
+    r"^search\s+and\s+summarize\s+(?:about\s+|on\s+|for\s+)?(.+)$",
+    r"^find\s+info(?:rmation)?\s+(?:about|on)\s+(.+)$",
+]
+
+_SELF_FIX_PATTERNS = [
+    r"\bfix karo\b",
+    r"\bcode update karo\b",
+    r"\bapna bug fix karo\b",
 ]
 

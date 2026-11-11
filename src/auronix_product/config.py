@@ -7,6 +7,7 @@ OLLAMA_URL = "http://localhost:11434"
 # Fast chit-chat model by default; switch to smart (qwen2.5:7b) for tools or "smart mode".
 OLLAMA_MODEL = "qwen2.5:3b"
 OLLAMA_SMART_MODEL = "qwen2.5:7b"
+OLLAMA_DOLPHIN_MODEL = "dolphin-uncensored:latest"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 WHISPER_LANGUAGE = "en"
 PIPER_VOICE = "en_US-lessac-medium"

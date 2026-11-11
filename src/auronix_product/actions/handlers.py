@@ -234,7 +234,7 @@ def _run_applescript_safe(script: str, context: str, timeout: int = 15) -> str:
             try:
                 fixed = llm.chat(
                     [{"role": "user", "content": fix_prompt}],
-                    model="qwen2.5-coder:7b",
+                    model=config.OLLAMA_DOLPHIN_MODEL,
                 )["content"]
             except LLMError:
                 fixed = llm.chat(

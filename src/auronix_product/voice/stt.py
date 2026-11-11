@@ -18,11 +18,9 @@ HALLUCINATIONS = {
 }
 
 DOMAIN_PROMPT = (
-    "Auronix assistant. Commands in English, Hindi, Hinglish. "
-    "Examples: what is the time, time kya hai, what is the weather in Delhi, "
-    "mausam kaisa hai, open Chrome, close Chrome, switch to dolphin, "
-    "my name is Harikesh, what is my name, how are you, battery status, "
-    "open spotify, close safari, find my file, khol do, band karo."
+    "Auronix, Start Auronix, Harikesh, Hari, Safari, Chrome, VS Code, Terminal, "
+    "GitHub, kholo, band karo, search karo, kya hai, battery, reminders, calendar, "
+    "audio status, stop, ruk ja."
 )
 
 # Common Whisper mishearings → corrections
