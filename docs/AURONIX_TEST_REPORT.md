@@ -1,38 +1,38 @@
-# Auronix 2.0 — Baseline Test Report (Stage 1)
+# Auronix 2.0 — Final & Baseline Test Report
 
-- **Captured:** `2026-11-11` (post Commit `32083e4`, zero local source modifications)
+- **Updated:** `2026-11-11` (Stage 7 & 8 Final Verification)
 - **Workspace:** `/Users/harikeshshukla/Auronix`
 - **Virtual Environment:** `/Users/harikeshshukla/Auronix/.venv` (`Python 3.11.18`, `pytest 9.2.0`)
 - **Pytest Configuration:** `testpaths = ["tests/product"]` (`pyproject.toml`)
-- **Command Run:** `pytest tests/product/ -v`
-- **Result:** **53 passed in 11.74s** (`0 failed`, `0 skipped`, `0 errors`)
 
 ---
 
-## 1. Test Inventory by Module (`tests/product/`)
+## 1. Product Suite Result (`pytest tests/product/ -v`)
+
+- **Command:** `pytest tests/product/ -v`
+- **Result:** **61 passed in 11.14s** (`0 failed`, `0 skipped`, `0 errors`) — expanded from 53 Stage-1 baseline tests to 61 tests across 11 product test modules:
 
 | Test File | Passed / Total | Coverage Scope & Verification Notes |
 |---|---|---|
-| [`test_edge_cases.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_edge_cases.py) | 8 / 8 | Continuous-mode stop variants, dynamic TTS wait bounds, `"open in browser"` negative guard, `minicpm-v` vision routing (`sips -Z 1024`), combined browser search non-split, `LLM.chat_stream` + `TTS.speak_stream` chunking, fast (`qwen2.5:3b`) vs smart (`qwen2.5:7b`) routing *(LLMs, TTS playback, `screencapture` mocked)* |
-| [`test_phase_c.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_c.py) | 9 / 9 | `sfx` audio paths, AppleScript quote escaping in `notify`, menubar state updates, Silero VAD audio capture bounds, Kokoro TTS streaming & barge-in stop, AppleScript repair confirmation gate, barge-in calibration & `limit=10` SQLite context, Agent SFX/UI/error wiring, STT repeat-loop filter & CoreAudio `-50` retry *(audio devices, LLM, AppleScript subprocess mocked)* |
-| [`test_phase_d.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_d.py) | 9 / 9 | System status & weather parsing, Calendar & Reminders AppleScript parsing/auth-error/60s cache, `BriefingBuilder` daily `state.json` & 3-sentence limit, `audio_guard` echo/hallucination & `ResilientAudioStream`, `ConversationContext` anaphoric follow-ups, Phase D safe router commands, live mic language/pending-intent/single-word guards, Silero VAD gate & LaunchAgent plist checks, Hinglish routing, 1.2s rolling wake buffer & daemon conflict warning *(subprocess/sounddevice/calendar mocked where external)* |
-| [`test_phase_g.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_g.py) | 4 / 4 | `SelfCoder` forbidden path blocking & `LOW`/`MEDIUM`/`HIGH` risk tiers, **real isolated temp git repo + real `pytest` execution + `git reset --hard HEAD` rollback on test failure**, Router `"fix karo"` / `"code update karo"` / `"apna bug fix karo"` gates, Dolphin (`dolphin-uncensored:latest`) system prompt, unified diff extraction, & `qwen2.5:3b` refusal/error fallback *(LLM chat/stream responses mocked; git & subprocess pytest real in temp dir)* |
-| [`test_research.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_research.py) | 4 / 4 | DuckDuckGo `/l/?uddg=` unwrap & HTML link extraction, Playwright Chromium top-3 research + citations, `FutureTimeout` & exception fallback to DuckDuckGo HTML/IA API, research router patterns & Agent announcement/summary flow *(Playwright browser, `httpx`, LLM mocked)* |
-| [`test_scheduler.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_scheduler.py) | 9 / 9 | SQLite reminder add & fire, natural time parsing, deterministic reminder/`at` routing, list/cancel reminder patterns, `execute_tool` dispatch, `ReminderScheduler` background thread tick & shutdown, Agent scheduler lifecycle & multi-tool reminder flows *(real SQLite in `tmp_path`; real scheduler thread; TTS mocked)* |
-| [`test_smoke.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_smoke.py) | 6 / 6 | Package imports, deterministic time & weather routing, SQLite fact save/recall (`"my name is ..."`), empty undo behavior, emoji stripping *(real SQLite in `tmp_path`)* |
-| [`test_wake.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_wake.py) | 4 / 4 | Real `WakeWordDetector` inference against `export/wake.onnx` + real/negative WAV clips (if present), PyAudio streaming & termination, `Agent` ONNX wake wiring, `Hotkey` (`Cmd+Shift+A`) fallback when ONNX missing *(ONNX inference real when assets exist; PyAudio stream mocked in stream test)* |
+| [`test_edge_cases.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_edge_cases.py) | 8 / 8 | Continuous stop variants, dynamic TTS wait, browser guards, `minicpm-v` vision (`sips -Z 1024`), combined search, streaming TTS, `qwen2.5:3b` vs `qwen2.5:7b` routing |
+| [`test_phase_c.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_c.py) | 9 / 9 | `sfx`, `notify` escaping, menubar updates, Silero VAD capture, Kokoro TTS & barge-in, AppleScript confirm gate, calibration & SQLite history (`limit=10`), Agent UI/error handling, CoreAudio `-50` retry |
+| [`test_phase_d.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_d.py) | 9 / 9 | System status & weather, Calendar/Reminders parsing & caching, `BriefingBuilder`, `audio_guard`, `ConversationContext`, Phase D safe routes, live mic guards, Silero VAD & LaunchAgent, Hinglish & rolling wake buffer |
+| [`test_phase_g.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_phase_g.py) | 4 / 4 | `SelfCoder` forbidden targets & risk tiers, isolated temp-repo snapshot backup & pytest restore (no auto-commit/`reset --hard`), Router & Agent confirmation gates, Dolphin wiring & fallback |
+| [`test_research.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_research.py) | 4 / 4 | DuckDuckGo unwrap & HTML links, Playwright top-3 research & citations, timeout/exception fallback to DuckDuckGo, research router patterns |
+| [`test_scheduler.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_scheduler.py) | 9 / 9 | SQLite reminder persistence, time parsing, router commands, `execute_tool`, background scheduler lifecycle, list/cancel flows |
+| [`test_smoke.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_smoke.py) | 6 / 6 | Imports, time/weather routing, SQLite fact save/recall, empty undo, emoji strip |
+| [`test_stage3.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_stage3.py) | 3 / 3 | `AuronixProviderRouter` (`ModelRouter` Gemini -> Ollama fallback, Dolphin no-`tools`), `/tmp/auronix_self_coder_backup/` + `PolicyEngine` + `Verifier` (zero `git reset`), unified `SQLiteMemoryStore` & secret redaction |
+| [`test_stage4_pipeline.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_stage4_pipeline.py) | 2 / 2 | `CodeReviewer` Gemini vs `qwen2.5:7b` routing; end-to-end `Researcher -> Coder -> Reviewer -> Verifier -> Apply` rejection (unmodified file + TTS notice) and approval flows |
+| [`test_stage6_memory.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_stage6_memory.py) | 3 / 3 | Research persistence to SQLite, SelfCoder applied/rejected coding lesson storage, `~/.auronix/auronix.log` (`INFO`/`WARN`/`ERROR`), and Agent voice memory queries (`yesterday`, `last research`) |
+| [`test_wake.py`](file:///Users/harikeshshukla/Auronix/tests/product/test_wake.py) | 4 / 4 | Real ONNX wake inference (`wake.onnx`), PyAudio stream lifecycle, `Agent` detector wiring, `Cmd+Shift+A` hotkey fallback |
 
 ---
 
-## 2. Core Foundation Suite (`tests/test_*.py`) Note
+## 2. Full Repository Test Suite (`tests/`)
 
-- Outside `tests/product/`, the repository also contains **64 root test modules** (`tests/test_*.py`, plus `tests/synthetic_eval/`) covering `auronix` security primitives (`PolicyEngine`, `ApprovalEngine`, `LifecycleEngine`, `ModelRouter`, `GeminiLifecycleHandlersBuilder`, `AgentOrchestrator`, `SQLiteMemoryStore`, `Verifier`, `ShellTool`, R9 attestation).
-- Those modules and the external `/Users/harikeshshukla/Auronix_R9_WORKTREE` were **not modified** in Stage 1. During Stage 3–8 implementation, relevant `tests/test_*.py` suites (`test_model_routing.py`, `test_agent_orchestration.py`, `test_memory.py`, `test_verifier.py`, `test_llm_handlers.py`) should be verified alongside `pytest tests/product/ -v` whenever touching shared integration contracts.
-
----
-
-## 3. Baseline Working Tree State
-
-- `git status -s` returned **empty (clean working tree)** on commit `32083e4` prior to writing these 8 Stage-1 `docs/AURONIX_*.md` files.
-- No source files under `src/` or tests under `tests/` were modified in Stage 1.
-
+- **Unfiltered `pytest tests/ -v`:** Stopped during collection (`1 error`) because [`tests/test_backup.py`](file:///Users/harikeshshukla/Auronix/tests/test_backup.py#L14) imports `scripts.auronix_backup`, which is absent (`scripts/` contains only `dev.sh` and `setup.sh`). Running `pytest` without `python -m` also fails collection on `tests/test_synthetic_eval_schema.py` without `.` on `sys.path`.
+- **Full Run via `python -m pytest tests/ --ignore=tests/test_backup.py -v`:**
+  - **Collected:** `1,409` items across `tests/product/` and root `tests/test_*.py`
+  - **Passed:** `1,328` (all 61 product tests + core routing, policy, approval, lifecycle, state, memory, verifier, orchestration, LLM handlers, shell/filesystem/local-transport/CLI tests pass)
+  - **Skipped:** `51` (platform-guarded Linux bubblewrap/namespace/cgroup tests cleanly skipped on macOS)
+  - **Failed:** `30` (all pre-existing failures in `tests/test_linux_acceptance_evidence.py`, due to missing `auronix-phase1-snapshot-v6/SNAPSHOT_MANIFEST.txt` historical Linux evidence archive and `executed-test-harness.py` SHA-256 mismatch unrelated to Auronix 2.0 changes)
