@@ -32,6 +32,7 @@ def get_current_time() -> str:
     return datetime.datetime.now().strftime("It's %I:%M %p on %A, %B %d, %Y")
 
 
+
 def get_weather(city: str = DEFAULT_CITY) -> str:
     try:
         geo = httpx.get(
@@ -313,20 +314,40 @@ def bring_to_front(app_name: str) -> str:
         return f"Could not activate {app_name}: {e}"
 
 
-def close_all_windows(app_name: str) -> str:
-    """L3 — batch close every window of an app (but keep app running)."""
+def close_all_windows(app_name: str = "") -> str:
+    """L3 — close every window of an app, or close active windows via Cmd+W when app_name is empty."""
     try:
-        script = f'''
-        tell application "{app_name}"
+        target = app_name.strip()
+        if target:
+            script = f'''
+        tell application "{target}"
             close every window
         end tell
         '''
-        out = _run_applescript_safe(script, f"close all windows of {app_name}", timeout=15)
+            out = _run_applescript_safe(script, f"close all windows of {target}", timeout=15)
+            if out.startswith(("Failed:", "AppleScript failed:")):
+                return out
+            return f"Closed all {target} windows."
+
+        script = 'tell application "System Events" to keystroke "w" using command down'
+        out = _run_applescript_safe(script, "close all active windows", timeout=10)
         if out.startswith(("Failed:", "AppleScript failed:")):
             return out
-        return f"Closed all {app_name} windows."
+        return "Closed windows."
     except Exception as e:
-        return f"Could not close {app_name} windows: {e}"
+        return f"Could not close windows: {e}"
+
+
+def lock_screen() -> str:
+    """Lock the macOS screen via Ctrl+Cmd+Q AppleScript keystroke."""
+    try:
+        script = 'tell application "System Events" to keystroke "q" using {control down, command down}'
+        out = _run_applescript_safe(script, "lock screen", timeout=10)
+        if out.startswith(("Failed:", "AppleScript failed:")):
+            return out
+        return "Screen locked."
+    except Exception as e:
+        return f"Could not lock screen: {e}"
 
 
 def minimize_all() -> str:
@@ -574,10 +595,23 @@ def capture_screen() -> str:
     """Capture screen to temp PNG file, resized to 1024px max dimension."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
-    subprocess.run(["screencapture", "-x", path], check=True, timeout=10)
+    try:
+        subprocess.run(["screencapture", "-x", path], check=True, timeout=10)
+    except FileNotFoundError:
+        try:
+            subprocess.run(["/usr/sbin/screencapture", "-x", path], check=True, timeout=10)
+        except Exception:
+            from ..skills.vision import VisionSkill
+
+            return VisionSkill(screenshot_path=path, max_dimension=1024).capture_screen(path)
     # Resize to max 1024px — moondream chokes on full Retina screenshots
     try:
         subprocess.run(["sips", "-Z", "1024", path], check=True, capture_output=True, timeout=10)
+    except FileNotFoundError:
+        try:
+            subprocess.run(["/usr/bin/sips", "-Z", "1024", path], check=True, capture_output=True, timeout=10)
+        except Exception as e:
+            print(f"[vision] resize failed (using original): {e}")
     except Exception as e:
         print(f"[vision] resize failed (using original): {e}")
     return path

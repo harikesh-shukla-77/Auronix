@@ -16,6 +16,7 @@ from ..voice import audio_guard
 from .patterns import (
     _TIME_PATTERNS, _WEATHER_PATTERNS, _DATE_PATTERNS, _SYSTEM_PATTERNS,
     _OPEN_PATTERNS, _CLOSE_PATTERNS, _BRING_FRONT_PATTERNS, _MINIMIZE_PATTERNS,
+    _CLOSE_ALL_WINDOWS_PATTERNS, _LOCK_SCREEN_PATTERNS,
     _UNDO_PATTERNS, _LIST_UNDO_PATTERNS, _LIST_FILES_PATTERNS,
     _MOVE_PATTERNS, _RENAME_PATTERNS, _TRASH_PATTERNS,
     _EMPTY_TRASH_PATTERNS, _SAVE_NAME_PATTERNS, _RECALL_NAME_PATTERNS,
@@ -23,10 +24,11 @@ from .patterns import (
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
     _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
     _CALENDAR_PATTERNS, _RESEARCH_PATTERNS, _SELF_FIX_PATTERNS,
+    _KNOWLEDGE_INDEX_PATTERNS, _KNOWLEDGE_QUERY_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
-    open_app, close_app, bring_to_front, close_all_windows, minimize_all,
+    open_app, close_app, bring_to_front, close_all_windows, lock_screen, minimize_all,
     list_files, move_file, rename_file, trash_file, empty_trash,
     undo_action, list_undoable, add_reminder, list_reminders, cancel_reminders,
     open_url, search_web, open_new_tab, _normalize_numbers, DEFAULT_CITY,
@@ -72,6 +74,18 @@ def _take_screenshot() -> str:
     try:
         subprocess.run(["screencapture", "-x", str(out_path)], check=True, timeout=5)
         return f"Screenshot saved to Desktop as {out_path.name}."
+    except FileNotFoundError:
+        try:
+            subprocess.run(["/usr/sbin/screencapture", "-x", str(out_path)], check=True, timeout=5)
+            return f"Screenshot saved to Desktop as {out_path.name}."
+        except Exception:
+            try:
+                from ..skills.vision import VisionSkill
+
+                VisionSkill(screenshot_path=out_path).capture_screen(out_path)
+                return f"Screenshot saved to Desktop as {out_path.name}."
+            except Exception as e:
+                return f"Screenshot failed: {e}"
     except Exception as e:
         return f"Screenshot failed: {e}"
 
@@ -159,7 +173,13 @@ class RoutedCommand:
 
 
 def quick_route(text: str, memory) -> RoutedCommand | None:
-    lower = text.lower().strip().rstrip(".!?, ")
+    stripped_wake = re.sub(
+        r"^(?:hey\s+)?(?:auronix|aaronix|ironix)[,:\s]+(?=\S)",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    lower = stripped_wake.lower().rstrip(".!?, ")
     normalized_lower = _normalize_numbers(lower)
 
     if "remind" in lower or "reminder" in lower:
@@ -200,6 +220,21 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             "What issue should I fix? Please describe the bug.",
             pending_intent="code_fix",
         )
+
+    raw_trimmed = stripped_wake
+    for pat in _KNOWLEDGE_INDEX_PATTERNS:
+        m = re.match(pat, raw_trimmed, re.IGNORECASE)
+        if m:
+            file_arg = m.group(1).strip().rstrip(".")
+            if file_arg:
+                return RoutedCommand(f"__KNOWLEDGE_INDEX__:{file_arg}")
+
+    for pat in _KNOWLEDGE_QUERY_PATTERNS:
+        m = re.match(pat, raw_trimmed, re.IGNORECASE)
+        if m:
+            topic = m.group(1).strip().rstrip("?.! ")
+            if topic:
+                return RoutedCommand(f"__KNOWLEDGE_QUERY__:{topic}")
 
     if lower in ("research", "research karo", "search and summarize"):
         return RoutedCommand("Sure, what would you like me to research?", pending_intent="research")
@@ -377,7 +412,14 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
     if any(re.search(pat, lower) for pat in _MINIMIZE_PATTERNS):
         return RoutedCommand(minimize_all())
 
-    # CLOSE ALL WINDOWS (L3)
+    # LOCK SCREEN
+    if any(re.search(pat, lower) for pat in _LOCK_SCREEN_PATTERNS):
+        return RoutedCommand(lock_screen())
+
+    # CLOSE ALL WINDOWS (generic + per-app)
+    if any(re.search(pat, lower) for pat in _CLOSE_ALL_WINDOWS_PATTERNS):
+        return RoutedCommand(close_all_windows())
+
     m = re.search(r"\b([A-Za-z]+) ki (sab|all) windows (band|close) karo", lower)
     if m:
         app = m.group(1).title()

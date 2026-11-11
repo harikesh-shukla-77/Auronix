@@ -324,3 +324,241 @@ def test_dolphin_model_wiring_diff_parse_and_fallback(tmp_path, monkeypatch):
     agent.llm.chat = MagicMock(side_effect=[LLMError("qwen failed"), {"content": "Dolphin tool fallback."}])
     assert agent._process("check plan file xyz") == "Dolphin tool fallback."
     assert agent.llm.chat.call_args_list[-1].kwargs["model"] == "dolphin-uncensored:latest"
+
+
+def test_self_coder_fuzzy_whitespace_patch_and_policy_verifier_gates(tmp_path):
+    from auronix.policy.engine import PolicyOutcome
+
+    src_dir = tmp_path / "src" / "auronix_product" / "actions"
+    test_dir = tmp_path / "tests"
+    src_dir.mkdir(parents=True)
+    test_dir.mkdir(parents=True)
+
+    target_file = src_dir / "router.py"
+    target_file.write_text(
+        "def greet(name):\n"
+        "    # Say hello cleanly\n"
+        '    return f"Hello, {name}!"\n',
+        encoding="utf-8",
+    )
+    (test_dir / "test_fuzzy_tmp.py").write_text(
+        "import importlib.util\n"
+        f"_SPEC = importlib.util.spec_from_file_location('tmp_fuzzy_router', {str(target_file)!r})\n"
+        "_MOD = importlib.util.module_from_spec(_SPEC)\n"
+        "_SPEC.loader.exec_module(_MOD)\n"
+        "def test_greet():\n"
+        '    assert _MOD.greet("Ada") == "Hello, Ada!"\n',
+        encoding="utf-8",
+    )
+
+    fake_llm = MagicMock()
+    coder = SelfCoder(
+        repo_root=tmp_path,
+        llm=fake_llm,
+        coder_model="dolphin-uncensored:latest",
+        log_path=tmp_path / "updates.log",
+        backup_dir=tmp_path / "backups",
+        test_cmd=[sys.executable, "-m", "pytest", "tests/", "-v"],
+    )
+    coder.reviewer.review_patch = MagicMock(return_value={"approved": True, "reason": "ok"})
+
+    # 1. Direct apply_fix + review_proposed_patch when old_code has an extra space
+    extra_space_patch = {
+        "blocked": False,
+        "error": "",
+        "file": "src/auronix_product/actions/router.py",
+        "old_code": '    return  f"Hello, {name}!"',
+        "new_code": '    print("hi")\n    return f"Hello, {name}!"',
+        "explanation": "Add debug print despite extra space in old_code",
+        "risk_level": "LOW",
+        "issue": "add print",
+    }
+    review = coder.review_proposed_patch(extra_space_patch)
+    assert review["approved"] is True
+    # Full patched file context reached CodeReviewer rather than only snippet fallback
+    reviewed_patched_arg = coder.reviewer.review_patch.call_args.args[1]
+    assert "def greet(name):" in reviewed_patched_arg and 'print("hi")' in reviewed_patched_arg
+
+    assert coder.apply_fix(extra_space_patch, "LOW") is True
+    assert 'print("hi")' in target_file.read_text(encoding="utf-8")
+    assert coder.last_verification is not None and coder.last_verification.passed is True
+    assert coder.last_policy_decision is not None
+    assert coder.last_policy_decision.outcome == PolicyOutcome.ALLOW
+
+    # 2. propose_fix resolves fuzzy multi-line block (extra space + 5-space indent) cleanly & keeps LOW risk
+    import json
+
+    fake_llm.chat.side_effect = [
+        {"content": '{"file": "src/auronix_product/actions/router.py"}'},
+        {
+            "content": json.dumps(
+                {
+                    "old_code": (
+                        "def  greet(name):\n"
+                        "     # Say hello cleanly\n"
+                        '    print("hi")\n'
+                        '    return f"Hello, {name}!"'
+                    ),
+                    "new_code": (
+                        "def greet(name):\n"
+                        "    # Say hello cleanly\n"
+                        '    print("hi")\n'
+                        '    print("log2")\n'
+                        '    return f"Hello, {name}!"'
+                    ),
+                    "explanation": "Add second log line.",
+                }
+            )
+        },
+    ]
+    patch = coder.propose_fix("Add second log line in greet")
+    assert patch["blocked"] is False
+    assert patch["match_mode"] == "fuzzy"
+    assert patch["match_similarity"] >= 0.90
+    assert patch["risk_level"] == "LOW"
+    assert coder.apply_fix(patch, patch["risk_level"]) is True
+    assert 'print("log2")' in target_file.read_text(encoding="utf-8")
+
+    # 2b. 10-15% comment/text difference in old_code still matches (>= 0.85) & snapshots to /tmp/auronix_self_coder_backup
+    pct12_patch = {
+        "blocked": False,
+        "error": "",
+        "file": "src/auronix_product/actions/router.py",
+        "old_code": (
+            "def greet(name):\n"
+            "    # Say hello cleanly\n"
+            '    print("hi")\n'
+            '    print("log2")\n'
+            '    return f"Hello, {name}!"'
+        ).replace("Say hello cleanly", "Say greet msg"),
+        "new_code": (
+            "def greet(name):\n"
+            "    # Say hello cleanly\n"
+            '    print("hi")\n'
+            '    print("log3")\n'
+            '    return f"Hello, {name}!"'
+        ),
+        "explanation": "Update log3 with ~12% diff in old_code comment",
+        "risk_level": "LOW",
+        "issue": "log3",
+    }
+    assert coder.apply_fix(pct12_patch, "LOW") is True
+    assert 'print("log3")' in target_file.read_text(encoding="utf-8")
+    assert coder.last_backup_path is not None and coder.last_backup_path.exists()
+
+    # 3. PolicyEngine still gates unapproved MEDIUM & BLOCKED changes; >15% mismatch fails safely
+    saved = target_file.read_text(encoding="utf-8")
+    unapproved_med = {
+        "blocked": False,
+        "error": "",
+        "file": "src/auronix_product/actions/router.py",
+        "old_code": '    return  f"Hello, {name}!"',
+        "new_code": '    return f"Hey, {name}!"',
+        "policy_approved": False,
+    }
+    assert coder.apply_fix(unapproved_med, "MEDIUM") is False
+    assert coder.last_policy_decision.outcome == PolicyOutcome.APPROVAL_REQUIRED
+    assert coder.evaluate_policy("src/auronix_product/actions/router.py", "BLOCKED", approved=True).outcome == PolicyOutcome.BLOCK
+    assert coder.apply_fix({**extra_space_patch, "old_code": "def completely_missing_fn(a, b, c):\n    return a * b * c"}, "LOW") is False
+    assert target_file.read_text(encoding="utf-8") == saved
+
+
+def test_self_coder_small_file_full_code_overwrite_and_large_file_mode(tmp_path):
+    import json
+    from auronix_product.skills.self_coder import DOLPHIN_SYSTEM_PROMPT
+
+    assert "return the complete modified file from top to bottom." in DOLPHIN_SYSTEM_PROMPT.lower()
+    assert "entire updated file content" in DOLPHIN_SYSTEM_PROMPT.lower()
+    assert "600 lines" in DOLPHIN_SYSTEM_PROMPT.lower()
+
+    src_dir = tmp_path / "src" / "auronix_product" / "actions"
+    test_dir = tmp_path / "tests"
+    src_dir.mkdir(parents=True)
+    test_dir.mkdir(parents=True)
+
+    target_file = src_dir / "router.py"
+    target_file.write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+    (test_dir / "test_full_tmp.py").write_text(
+        "import importlib.util\n"
+        f"_SPEC = importlib.util.spec_from_file_location('tmp_full_router', {str(target_file)!r})\n"
+        "_MOD = importlib.util.module_from_spec(_SPEC)\n"
+        "_SPEC.loader.exec_module(_MOD)\n"
+        "def test_greet():\n"
+        "    assert _MOD.greet() == 'hello'\n",
+        encoding="utf-8",
+    )
+
+    fake_llm = MagicMock()
+    coder = SelfCoder(
+        repo_root=tmp_path,
+        llm=fake_llm,
+        coder_model="dolphin-uncensored:latest",
+        log_path=tmp_path / "updates.log",
+        backup_dir=tmp_path / "backups",
+        test_cmd=[sys.executable, "-m", "pytest", "tests/", "-v"],
+    )
+    coder.reviewer.review_patch = MagicMock(return_value={"approved": True, "reason": "ok"})
+
+    # 1. Small file (< 500 lines) with JSON full_code response -> prompts for whole file & overwrites cleanly
+    full_updated = "def greet():\n    print('[full]')\n    return 'hello'\n"
+    fake_llm.chat.side_effect = [
+        {"content": '{"file": "src/auronix_product/actions/router.py"}'},
+        {"content": json.dumps({"full_code": full_updated, "explanation": "Log in greet"})},
+    ]
+    patch1 = coder.propose_fix("Add log in greet")
+    prompt1 = fake_llm.chat.call_args.args[0][1]["content"]
+    assert "Return the complete modified file from top to bottom." in prompt1
+    assert patch1["blocked"] is False
+    assert patch1["full_file"] is True
+    assert patch1["match_mode"] == "full_file"
+    assert patch1["risk_level"] == "LOW"
+    assert coder.apply_fix(patch1, patch1["risk_level"]) is True
+    assert target_file.read_text(encoding="utf-8") == full_updated
+
+    # 2. Small file (< 500 lines) with raw ```python ...``` fenced whole-file fallback
+    fenced_full = (
+        "```python\n"
+        "def greet():\n"
+        "    print('[full]')\n"
+        "    return 'hello'\n\n"
+        "def farewell():\n"
+        "    return 'bye'\n"
+        "```"
+    )
+    fake_llm.chat.side_effect = [
+        {"content": '{"file": "src/auronix_product/actions/router.py"}'},
+        {"content": fenced_full},
+    ]
+    patch2 = coder.propose_fix("Add farewell helper")
+    assert patch2["blocked"] is False
+    assert patch2["full_file"] is True
+    assert patch2["risk_level"] == "MEDIUM"
+    assert coder.apply_fix(patch2, patch2["risk_level"]) is True
+    assert "def farewell():" in target_file.read_text(encoding="utf-8")
+
+    # 3. Large file (>= 600 lines) requests targeted old_code/new_code rather than whole-file dump
+    large_file = src_dir / "large_mod.py"
+    large_lines = [f"VAL_{i} = {i}" for i in range(615)] + ["def tail_fn():", "    return 42"]
+    large_file.write_text("\n".join(large_lines) + "\n", encoding="utf-8")
+    fake_llm.chat.side_effect = [
+        {"content": '{"file": "src/auronix_product/actions/large_mod.py"}'},
+        {
+            "content": json.dumps(
+                {
+                    "old_code": "def  tail_fn():\n    return 42",
+                    "new_code": "def tail_fn():\n    print('[tail]')\n    return 42",
+                    "explanation": "Add debug print",
+                }
+            )
+        },
+    ]
+    patch3 = coder.propose_fix("Inspect large_mod tail_fn")
+    prompt3 = fake_llm.chat.call_args.args[0][1]["content"]
+    assert "Return the complete modified file from top to bottom." not in prompt3
+    assert '"old_code"' in prompt3
+    assert patch3["blocked"] is False
+    assert patch3.get("full_file") is None
+    assert patch3["match_mode"] == "fuzzy"
+    assert patch3["risk_level"] == "LOW"
+    assert coder.apply_fix(patch3, patch3["risk_level"]) is True
+    assert "print('[tail]')" in large_file.read_text(encoding="utf-8")

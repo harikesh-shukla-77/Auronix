@@ -46,6 +46,16 @@ _MINIMIZE_PATTERNS = [
     r"\bsab minimize\b",
 ]
 
+_CLOSE_ALL_WINDOWS_PATTERNS = [
+    r"\bclose\s+all\s+(?:the\s+)?windows\b",
+    r"\bsab\s+windows\s+(?:band|close)\s+karo\b",
+]
+
+_LOCK_SCREEN_PATTERNS = [
+    r"\block\s+(?:the\s+|my\s+)?screen\b",
+    r"\bscreen\s+lock\s+karo\b",
+]
+
 _UNDO_PATTERNS = [
     r"^undo$",
     r"\bundo\b",
@@ -146,10 +156,11 @@ _NEW_TAB_PATTERNS = [
 ]
 
 _VISION_PATTERNS = [
-    r"what.{0,10}(is |'s )?on (my |the )?screen",
+    r"what.{0,10}(is |'s )?on (?:(?:my |the ))?screen",
+    r"(?:what|read|check|explain|diagnose)\s+(?:the\s+|is\s+)?errors?\s+(?:is\s+)?on\s+(?:(?:my|the)\s+)?screen",
     r"read (my |the )?screen",
     r"what do you see",
-    r"analyze (my |the )?screen",
+    r"analyze (?:(?:my|the)\s+)?screen",
     r"screen (dekho|padho|batao)",
     r"read (the |all )?(news|articles|results|page)",
     r"read (it|them) (all |carefully )?(out |aloud )?",
@@ -173,5 +184,14 @@ _SELF_FIX_PATTERNS = [
     r"\bfix karo\b",
     r"\bcode update karo\b",
     r"\bapna bug fix karo\b",
+]
+
+_KNOWLEDGE_INDEX_PATTERNS = [
+    r"^(?:please\s+|can\s+you\s+)?(?:remember|index|learn|read\s+and\s+remember|save)\s+(?:this\s+|the\s+)?file\s*:?\s+(.+)$",
+]
+
+_KNOWLEDGE_QUERY_PATTERNS = [
+    r"^(?:please\s+|tell\s+me\s+)?what\s+do\s+(?:i|we)\s+know\s+about\s+(.+?)[\s?.!]*$",
+    r"^(?:search|check)\s+my\s+(?:documents|docs|knowledge|notes)\s+(?:for|about)\s+(.+?)[\s?.!]*$",
 ]
 

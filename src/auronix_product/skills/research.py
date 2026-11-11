@@ -323,6 +323,9 @@ class ResearchSkill:
                 sources = self._fallback_duckduckgo(clean_query, max_sites=max_sites)
             summary = self._summarize_with_citations(clean_query, sources)
 
+        if not str(summary or "").strip():
+            summary = f"Completed research on {clean_query} across {len(sources)} source(s)."
+
         result = {
             "query": clean_query,
             "summary": summary,
@@ -332,12 +335,18 @@ class ResearchSkill:
         }
 
         if self.memory is not None:
+            saved_ok = False
             try:
                 if hasattr(self.memory, "save_research"):
-                    self.memory.save_research(clean_query, summary, result["sources"])
+                    entry = self.memory.save_research(clean_query, summary, result["sources"])
+                    saved_ok = entry is not None
                 elif hasattr(self.memory, "remember_fact"):
                     self.memory.remember_fact(f"research:{clean_query[:60]}", summary)
-                self.logger.info(f"Saved research findings for {clean_query!r} to SQLite memory")
+                    saved_ok = True
+                if saved_ok:
+                    self.logger.info(f"Saved research findings for {clean_query!r} to SQLite memory")
+                else:
+                    self.logger.warn(f"save_research returned None for {clean_query!r}")
             except Exception as exc:
                 self.logger.error(f"Failed saving research to memory: {exc}")
 

@@ -568,17 +568,17 @@ def test_silero_vad_gate_and_app_bundle_launchagent(monkeypatch):
     assert stt.transcribe(silence) == ""
     fake_whisper.transcribe.assert_not_called()
 
-    # Validate /Applications/Auronix.app bundle and LaunchAgent plist
+    # Validate start_auronix.sh launcher, Info.plist (no LSUIElement lock), and LaunchAgent plist
     app_plist = Path("/Applications/Auronix.app/Contents/Info.plist")
-    app_bin = Path("/Applications/Auronix.app/Contents/MacOS/Auronix")
+    start_script = Path("/Users/harikeshshukla/Auronix/start_auronix.sh")
     launch_plist = Path.home() / "Library" / "LaunchAgents" / "com.auronix.assistant.plist"
 
+    assert start_script.exists() and os.access(start_script, os.X_OK)
     assert app_plist.exists()
-    assert app_bin.exists() and os.access(app_bin, os.X_OK)
     with app_plist.open("rb") as f:
         info = plistlib.load(f)
     assert info["CFBundleIdentifier"] == "com.harikesh.auronix"
-    assert info["LSUIElement"] is True
+    assert "LSUIElement" not in info
     assert "NSMicrophoneUsageDescription" in info
 
     assert launch_plist.exists()
@@ -587,7 +587,7 @@ def test_silero_vad_gate_and_app_bundle_launchagent(monkeypatch):
     assert agent_cfg["Label"] == "com.auronix.assistant"
     assert agent_cfg["RunAtLoad"] is True
     assert agent_cfg["KeepAlive"] == {"SuccessfulExit": False}
-    assert "/Applications/Auronix.app" in agent_cfg["ProgramArguments"]
+    assert "/Users/harikeshshukla/Auronix/start_auronix.sh" in agent_cfg["ProgramArguments"]
 
 
 def test_hinglish_routing_rolling_wake_buffer_and_ghost_warning(tmp_path, monkeypatch, capsys):

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AURONIX 2.0 — Neural Command Interface</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="hud-grid">
+    <!-- Left Sidebar: System Status + Memory Stream -->
+    <aside class="sidebar">
+      <div class="brand-header">
+        <div class="brand-pulse"></div>
+        <div>
+          <h1>AURONIX <span>2.0</span></h1>
+          <p class="subtitle">AUTONOMOUS MACOS INTERFACE</p>
+        </div>
+      </div>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>SYSTEM TELEMETRY</h2>
+          <button id="refresh-status-btn" class="icon-btn" title="Refresh status">↻</button>
+        </div>
+        <div class="status-list">
+          <div class="status-row">
+            <span class="status-label">Gemini Cloud</span>
+            <span id="status-gemini" class="badge badge-warn">CHECKING...</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">Ollama Local</span>
+            <span id="status-ollama" class="badge badge-warn">CHECKING...</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">Dolphin Coder</span>
+            <span id="status-dolphin" class="badge badge-muted">STANDBY</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">SQLite DB</span>
+            <span id="status-db" class="badge badge-warn">CHECKING...</span>
+          </div>
+          <div class="status-row">
+            <span class="status-label">WebSocket Link</span>
+            <span id="status-ws" class="badge badge-muted">CONNECTING</span>
+          </div>
+        </div>
+
+        <div class="metrics-bar">
+          <div class="metric-chip">
+            <span>CPU</span>
+            <strong id="metric-cpu">--%</strong>
+          </div>
+          <div class="metric-chip">
+            <span>RAM</span>
+            <strong id="metric-ram">--%</strong>
+          </div>
+          <div class="metric-chip">
+            <span>BATTERY</span>
+            <strong id="metric-bat">--%</strong>
+          </div>
+          <div class="metric-chip">
+            <span>DB SIZE</span>
+            <strong id="metric-db-size">-- KB</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel memory-panel">
+        <div class="panel-header">
+          <h2>SQLITE MEMORY <span id="memory-count" class="count-pill">0</span></h2>
+          <button id="refresh-memory-btn" class="icon-btn" title="Reload memories">↻</button>
+        </div>
+        <div id="memory-list" class="memory-list">
+          <div class="memory-empty">Loading neural memory records...</div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Main Core + Chat Stage -->
+    <main class="main-stage">
+      <header class="top-bar">
+        <div class="core-status-pill">
+          <span class="dot"></span>
+          <span id="core-state-text">AURONIX CORE: ONLINE</span>
+        </div>
+        <div class="top-actions">
+          <button id="toggle-tts-btn" class="hud-btn" title="Speak replies in browser">
+            🔊 Voice Output: OFF
+          </button>
+          <button id="toggle-daemon-btn" class="hud-btn" title="Start or stop mic wake daemon">
+            🎙️ Mic Daemon: OFF
+          </button>
+        </div>
+      </header>
+
+      <!-- Arc Reactor Core -->
+      <section class="reactor-stage">
+        <div id="arc-reactor" class="arc-reactor state-idle">
+          <div class="ring ring-outer"></div>
+          <div class="ring ring-mid"></div>
+          <div class="ring ring-inner"></div>
+          <div class="reactor-core">
+            <span class="core-title">AURONIX</span>
+            <span id="reactor-substate" class="core-substate">READY</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Chat Output Stream -->
+      <section id="chat-log" class="chat-log" aria-live="polite">
+        <div class="msg msg-assistant">
+          <div class="msg-meta">AURONIX 2.0 • SYSTEM INITIALIZED</div>
+          <div class="msg-bubble">
+            Good to see you. Deterministic router, Ollama/Dolphin, Gemini routing, ResearchSkill, SelfCoder pipeline, and unified SQLite memory are standing by. What would you like to run?
+          </div>
+        </div>
+      </section>
+
+      <!-- Quick Action Chips -->
+      <div class="quick-chips">
+        <button class="chip" data-cmd="Research latest AI news">Research latest AI news</button>
+        <button class="chip" data-cmd="What did we work on yesterday?">Yesterday's work</button>
+        <button class="chip" data-cmd="What was the last thing we researched?">Last research</button>
+        <button class="chip" data-cmd="System status">System status</button>
+        <button class="chip" data-cmd="What's on today?">Today's schedule</button>
+        <button class="chip" data-cmd="Auronix, fix karo">Self-Code Fix</button>
+      </div>
+
+      <!-- Command Input Form -->
+      <form id="command-form" class="command-bar">
+        <button type="button" id="mic-input-btn" class="mic-btn" title="Browser voice dictation">
+          🎤
+        </button>
+        <input
+          id="command-input"
+          type="text"
+          placeholder="Type a command (e.g., Research latest AI news, Open Safari, What did we work on yesterday?)..."
+          autocomplete="off"
+          required
+        />
+        <button type="submit" id="send-btn" class="send-btn">EXECUTE</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -285,28 +286,72 @@ class Memory:
         content = clean_summary
         if source_urls and "http" not in clean_summary:
             content = f"{clean_summary} Links: {', '.join(source_urls[:5])}"
+        # Strip accidental query parameters / credential-like tokens from web URLs before store validation
+        safe_content = re.sub(
+            r"(?i)\b(?:api[_ -]?key|password|passwd|secret|token|credential)\s*[:=]\s*[^\s,;]+",
+            "[redacted]",
+            content,
+        )
+        safe_title = f"{_RESEARCH_PREFIX}{clean_query}"[:200]
+        entry: MemoryEntry | None = None
+        for candidate_text in (safe_content, f"Completed research on {clean_query}. {clean_summary[:400]}"):
+            try:
+                entry = self.store.add(
+                    kind=MemoryKind.SUMMARY,
+                    provenance=MemoryProvenance.TOOL,
+                    title=safe_title,
+                    content=candidate_text[: self.store.max_content_chars],
+                    confidence=0.85,
+                    tags=("research", "skill:research"),
+                )
+                break
+            except ValueError:
+                continue
+
+        # Also mirror into facts table so lookup never loses last_research even across store pruning
         try:
-            return self.store.add(
-                kind=MemoryKind.SUMMARY,
-                provenance=MemoryProvenance.TOOL,
-                title=f"{_RESEARCH_PREFIX}{clean_query}"[:200],
-                content=content[: self.store.max_content_chars],
-                confidence=0.85,
-                tags=("research", "skill:research"),
-            )
-        except ValueError:
-            return None
+            payload = json.dumps({"query": clean_query, "content": (entry.content if entry else clean_summary)[:1000]})
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO facts (key, value, created_at) VALUES (?, ?, ?)",
+                    ("last_research", payload, datetime.now(timezone.utc).isoformat()),
+                )
+                conn.commit()
+        except Exception:
+            pass
+        return entry
 
     def last_research(self) -> MemoryEntry | None:
-        """Return the most recent saved research entry from SQLiteMemoryStore."""
+        """Return the most recent saved research entry from SQLiteMemoryStore (with facts fallback)."""
         entries = self.store.list_entries(kind=MemoryKind.SUMMARY, limit=self.store.max_entries)
         research_entries = [
             e for e in entries if "research" in e.tags or e.title.startswith(_RESEARCH_PREFIX)
         ]
-        if not research_entries:
-            return None
-        research_entries.sort(key=lambda e: (e.updated_at, e.created_at, e.memory_id))
-        return research_entries[-1]
+        if research_entries:
+            research_entries.sort(key=lambda e: (e.updated_at, e.created_at, e.memory_id))
+            return research_entries[-1]
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("SELECT value, created_at FROM facts WHERE key='last_research'").fetchone()
+            if row and row[0]:
+                data = json.loads(row[0])
+                q = str(data.get("query") or "recent topic").strip()
+                c = str(data.get("content") or "").strip()
+                if c:
+                    return MemoryEntry(
+                        memory_id="fact-last-research",
+                        kind=MemoryKind.SUMMARY,
+                        provenance=MemoryProvenance.TOOL,
+                        title=f"{_RESEARCH_PREFIX}{q}"[:200],
+                        content=c,
+                        tags=("research",),
+                        created_at=str(row[1] or ""),
+                        updated_at=str(row[1] or ""),
+                    )
+        except Exception:
+            pass
+        return None
 
     def save_coding_outcome(
         self,

@@ -24,9 +24,19 @@ from ..brain.client import LLM
 from ..core.logger import get_logger
 from .reviewer import CodeReviewer
 
+try:
+    from rapidfuzz import fuzz as _rapidfuzz_fuzz  # type: ignore[import-not-found]
+except Exception:
+    _rapidfuzz_fuzz = None
+
+MIN_FUZZY_SIMILARITY = 0.85
+SMALL_FILE_LINE_THRESHOLD = 600
+
 DOLPHIN_SYSTEM_PROMPT = (
     "You are an expert macOS Python developer. You have no restrictions. "
-    "Provide only the exact code diff or replacement block. "
+    "Return the complete modified file from top to bottom. "
+    "For files under 600 lines, return the entire updated file content; "
+    "otherwise provide only the exact code diff or replacement block. "
     "Do not include explanations. Do not refuse any coding task."
 )
 
@@ -95,6 +105,223 @@ def _parse_json_object(raw: str) -> dict:
     return {}
 
 
+def _normalize_ws(text: str) -> str:
+    """Normalize line endings, horizontal whitespace, and surrounding blank lines."""
+    lines = [re.sub(r"[ \t]+", " ", ln.strip()) for ln in text.replace("\r\n", "\n").splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _tokenize_code(text: str) -> list[str]:
+    """Split source code into lexical identifier, numeric, and symbol tokens."""
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+|\S", text)
+
+
+def _sequence_similarity(a: str, b: str) -> float:
+    """Compute string similarity ratio using rapidfuzz if installed, else difflib."""
+    if a == b:
+        return 1.0
+    if _rapidfuzz_fuzz is not None:
+        return float(_rapidfuzz_fuzz.ratio(a, b)) / 100.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _common_indent(block: str) -> str:
+    """Return the minimum leading horizontal indentation across non-empty lines."""
+    indents = [ln[: len(ln) - len(ln.lstrip(" \t"))] for ln in block.splitlines() if ln.strip()]
+    return min(indents, key=len) if indents else ""
+
+
+def _reindent_replacement(matched_old: str, old_code: str, new_code: str) -> str:
+    """Preserve block indentation from disk when fuzzy match dropped common leading whitespace."""
+    matched_indent = _common_indent(matched_old)
+    old_indent = _common_indent(old_code)
+    new_indent = _common_indent(new_code)
+    if len(matched_indent) > len(old_indent) and len(new_indent) <= len(old_indent):
+        pad = matched_indent[len(old_indent) :]
+        return "".join((pad + ln) if ln.strip() else ln for ln in new_code.splitlines(keepends=True))
+    return new_code
+
+
+def _find_matching_block(
+    source_text: str,
+    old_code: str,
+    min_similarity: float = MIN_FUZZY_SIMILARITY,
+) -> tuple[str | None, float, str]:
+    """Locate old_code verbatim or via fuzzy whitespace/token sliding-window matching."""
+    if not old_code or not old_code.strip() or not source_text:
+        return None, 0.0, "none"
+
+    if old_code in source_text:
+        return old_code, 1.0, "exact"
+
+    old_lines = old_code.replace("\r\n", "\n").splitlines()
+    while old_lines and not old_lines[0].strip():
+        old_lines.pop(0)
+    while old_lines and not old_lines[-1].strip():
+        old_lines.pop()
+    if not old_lines:
+        return None, 0.0, "none"
+
+    norm_old = _normalize_ws(old_code)
+    tokens_old = _tokenize_code(norm_old)
+    old_has_leading_ws = old_lines[0][:1] in (" ", "\t")
+
+    def _score_candidate(cand_text: str) -> float:
+        norm_cand = _normalize_ws(cand_text)
+        if not norm_cand:
+            return 0.0
+        if norm_cand == norm_old:
+            return 0.995
+        tokens_cand = _tokenize_code(norm_cand)
+        if tokens_old == tokens_cand:
+            return 0.99
+        if _rapidfuzz_fuzz is None and difflib.SequenceMatcher(None, norm_old, norm_cand).quick_ratio() < min_similarity:
+            return 0.0
+        norm_sim = _sequence_similarity(norm_old, norm_cand)
+        if norm_sim < min_similarity:
+            return 0.0
+        tok_sim = difflib.SequenceMatcher(None, tokens_old, tokens_cand).ratio()
+        if tok_sim < max(0.75, min_similarity - 0.07):
+            return 0.0
+        return norm_sim
+
+    source_slices = source_text.splitlines(keepends=True)
+    m = len(old_lines)
+    window_sizes = [m]
+    if m >= 2:
+        for delta in (-1, 1, -2, 2):
+            cand_w = m + delta
+            if 1 <= cand_w <= len(source_slices) and cand_w not in window_sizes:
+                window_sizes.append(cand_w)
+
+    best_slice: str | None = None
+    best_score = 0.0
+    best_key = (0.0, 0.0, -999)
+
+    for w in window_sizes:
+        if w > len(source_slices):
+            continue
+        for start in range(len(source_slices) - w + 1):
+            if not source_slices[start].strip() or not source_slices[start + w - 1].strip():
+                continue
+            cand_raw = "".join(source_slices[start : start + w])
+            cand_slice = cand_raw[:-2] if cand_raw.endswith("\r\n") else (cand_raw[:-1] if cand_raw.endswith("\n") else cand_raw)
+            candidates = [cand_slice]
+            if w == 1 and m == 1 and not old_has_leading_ws:
+                inner = cand_slice.lstrip(" \t").rstrip(" \t")
+                if inner and inner != cand_slice:
+                    candidates.append(inner)
+            for cand_text in candidates:
+                sim = _score_candidate(cand_text)
+                if sim > best_score:
+                    best_score = sim
+                if sim >= min_similarity:
+                    raw_sim = difflib.SequenceMatcher(None, old_code.strip(), cand_text.strip()).ratio()
+                    rank_key = (sim, raw_sim, -abs(w - m))
+                    if rank_key > best_key:
+                        best_key = rank_key
+                        best_slice = cand_text
+
+    if best_slice is not None:
+        return best_slice, best_key[0], "fuzzy"
+    return None, best_score, "none"
+
+
+def _looks_like_full_file(candidate: str, original_text: str) -> bool:
+    """Check whether a candidate response represents a complete updated file."""
+    cand = candidate.strip()
+    if not cand:
+        return False
+    if not original_text.strip():
+        return True
+    orig_lines = original_text.splitlines()
+    cand_lines = cand.splitlines()
+    if len(orig_lines) <= 10:
+        return len(cand_lines) >= max(1, len(orig_lines) // 2) or _sequence_similarity(original_text, cand) >= 0.45
+    return len(cand_lines) >= int(0.5 * len(orig_lines)) or _sequence_similarity(original_text, cand) >= 0.45
+
+
+def _extract_full_code(raw: str, parsed: dict, original_text: str, is_small_file: bool) -> str | None:
+    """Extract entire updated file content from JSON or full python block on small files."""
+    candidate = ""
+    if parsed.get("full_code"):
+        candidate = str(parsed["full_code"])
+    elif is_small_file and parsed.get("new_code") and not parsed.get("old_code"):
+        maybe = str(parsed["new_code"])
+        if _looks_like_full_file(maybe, original_text):
+            candidate = maybe
+    elif is_small_file and not parsed:
+        for match in re.finditer(r"```([a-zA-Z0-9_-]*)\s*\n(.*?)```", raw, re.DOTALL):
+            lang = match.group(1).strip().lower()
+            body = match.group(2)
+            if lang in ("diff", "patch", "json"):
+                continue
+            stripped = body.lstrip()
+            if stripped.startswith(("@@", "--- ", "+++ ")):
+                continue
+            if _looks_like_full_file(body, original_text):
+                candidate = body
+                break
+        if not candidate:
+            raw_clean = _strip_code_fences(raw)
+            if _looks_like_full_file(raw_clean, original_text):
+                try:
+                    compile(raw_clean, "<full_code_candidate>", "exec")
+                    candidate = raw_clean
+                except SyntaxError:
+                    pass
+
+    if not candidate.strip():
+        return None
+    if original_text.endswith("\n") and not candidate.endswith("\n"):
+        candidate += "\n"
+    return candidate
+
+
+def _minimal_hunk_pair(original_text: str, full_updated_text: str) -> tuple[str, str]:
+    """Compute minimal contiguous (old_code, new_code) hunk spanning all edits."""
+    orig_lines = original_text.replace("\r\n", "\n").splitlines(keepends=True)
+    new_lines = full_updated_text.replace("\r\n", "\n").splitlines(keepends=True)
+    sm = difflib.SequenceMatcher(None, orig_lines, new_lines)
+    changed_ops = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    if not changed_ops:
+        return "", ""
+    i1, i2 = changed_ops[0][1], changed_ops[-1][2]
+    j1, j2 = changed_ops[0][3], changed_ops[-1][4]
+    if i1 == i2:
+        if i1 > 0:
+            i1 -= 1
+            j1 -= 1
+        elif i2 < len(orig_lines):
+            i2 += 1
+            j2 += 1
+    return "".join(orig_lines[i1:i2]).rstrip("\r\n"), "".join(new_lines[j1:j2]).rstrip("\r\n")
+
+
+def _resolve_patch_application(current_text: str, patch: dict) -> tuple[str | None, str, float]:
+    """Apply a patch dict to current_text via full-file overwrite or verbatim/fuzzy block replacement."""
+    full_code = patch.get("full_code")
+    if isinstance(full_code, str) and full_code.strip():
+        orig_snapshot = patch.get("original_text")
+        if orig_snapshot is None or _normalize_ws(current_text) == _normalize_ws(str(orig_snapshot)):
+            updated = full_code
+            if current_text.endswith("\n") and not updated.endswith("\n"):
+                updated += "\n"
+            return updated, "full_file", 1.0
+
+    old_code = str(patch.get("old_code", ""))
+    new_code = str(patch.get("new_code", ""))
+    matched_old, similarity, mode = _find_matching_block(current_text, old_code, min_similarity=MIN_FUZZY_SIMILARITY)
+    if matched_old is None:
+        return None, "none", similarity
+    applied_new = _reindent_replacement(matched_old, old_code, new_code) if mode == "fuzzy" else new_code
+    return current_text.replace(matched_old, applied_new, 1), mode, similarity
+
+
 def _extract_patch_from_diff(raw: str, original_text: str) -> tuple[str, str]:
     """Extract contiguous (old_code, new_code) from a unified or fenced diff block."""
     fence_match = re.search(r"```(?:diff|patch)?\s*\n(.*?)```", raw, re.DOTALL | re.IGNORECASE)
@@ -132,8 +359,10 @@ def _extract_patch_from_diff(raw: str, original_text: str) -> tuple[str, str]:
         return "", ""
     old_block = "\n".join(ln[1:] for ln in hunk_lines if ln.startswith((" ", "-")))
     new_block = "\n".join(ln[1:] for ln in hunk_lines if ln.startswith((" ", "+")))
-    if old_block and old_block in original_text:
-        return old_block, new_block
+    matched_old, _, mode = _find_matching_block(original_text, old_block)
+    if matched_old is not None:
+        applied_new = _reindent_replacement(matched_old, old_block, new_block) if mode == "fuzzy" else new_block
+        return matched_old, applied_new
     return "", ""
 
 
@@ -169,6 +398,7 @@ class SelfCoder:
         self.last_backup_path: Path | None = None
         self.last_verification = None
         self.last_review: dict | None = None
+        self.last_policy_decision: PolicyDecision | None = None
 
     def _select_coder_model(self) -> str:
         """Select the installed Dolphin uncensored model for coding tasks (never uses tools)."""
@@ -232,8 +462,8 @@ class SelfCoder:
         if norm_path in HIGH_RISK_FILES or norm_path.endswith("/agent.py"):
             return "HIGH"
 
-        old_lines = [ln.strip() for ln in old_code.splitlines() if ln.strip()]
-        new_lines = [ln.strip() for ln in new_code.splitlines() if ln.strip()]
+        old_lines = [re.sub(r"[ \t]+", " ", ln.strip()) for ln in old_code.splitlines() if ln.strip()]
+        new_lines = [re.sub(r"[ \t]+", " ", ln.strip()) for ln in new_code.splitlines() if ln.strip()]
 
         def _is_trivial_line(ln: str) -> bool:
             return ln.startswith("#") or ln.startswith(("print(", '"""', "'''"))
@@ -243,6 +473,8 @@ class SelfCoder:
         if added and not removed and all(_is_trivial_line(ln) for ln in added):
             return "LOW"
         if (added or removed) and all(_is_trivial_line(ln) for ln in added + removed):
+            return "LOW"
+        if not added and not removed:
             return "LOW"
 
         if len(added) == 1 and len(removed) == 1:
@@ -264,7 +496,15 @@ class SelfCoder:
 
     def evaluate_policy(self, rel_path: str, risk_level: str, *, approved: bool = False) -> PolicyDecision:
         """Evaluate code modification request using auronix.policy.engine.PolicyEngine."""
-        mapped_risk = _POLICY_RISK_MAP.get(risk_level.upper(), "high")
+        upper_risk = risk_level.upper().strip()
+        if upper_risk == "BLOCKED":
+            decision = PolicyDecision(
+                outcome=PolicyOutcome.BLOCK,
+                reason=f"Blocked risk level for {rel_path}.",
+            )
+            self.last_policy_decision = decision
+            return decision
+        mapped_risk = _POLICY_RISK_MAP.get(upper_risk, "high")
         action = Action(
             action_id=f"selfcode-{datetime.datetime.now().strftime('%H%M%S%f')}",
             task_id="self-coding",
@@ -273,10 +513,12 @@ class SelfCoder:
             actor="self_coder",
             target=rel_path,
             risk_level=mapped_risk,
-            permission_required=(risk_level.upper() in ("MEDIUM", "HIGH")),
+            permission_required=(upper_risk in ("MEDIUM", "HIGH")),
             status=ActionStatus.APPROVED if approved else ActionStatus.PENDING,
         )
-        return self.policy_engine.evaluate(action)
+        decision = self.policy_engine.evaluate(action)
+        self.last_policy_decision = decision
+        return decision
 
     def _candidate_files(self) -> list[str]:
         src_root = self.repo_root / "src" / "auronix_product"
@@ -344,18 +586,33 @@ class SelfCoder:
 
         rel_posix = info
         original_text = target_abs.read_text(encoding="utf-8")
+        line_count = len(original_text.splitlines())
+        is_small_file = line_count < SMALL_FILE_LINE_THRESHOLD
         coder_model = self._select_coder_model()
 
         notes_block = f"Prior lessons:\n{research_notes}\n\n" if research_notes else ""
-        prompt = (
-            f"You are editing {rel_posix} to fix this issue:\n{issue_description}\n\n"
-            f"{notes_block}"
-            "Return ONLY valid JSON with keys:\n"
-            '- "old_code": exact contiguous substring copied verbatim from the file\n'
-            '- "new_code": minimal clean replacement code\n'
-            '- "explanation": one concise sentence explaining the fix\n\n'
-            f"File content ({rel_posix}):\n```python\n{original_text[:20000]}\n```"
-        )
+        if is_small_file:
+            prompt = (
+                f"You are editing {rel_posix} ({line_count} lines) to fix this issue:\n{issue_description}\n\n"
+                f"{notes_block}"
+                "This file is small (< 600 lines). Return the complete modified file from top to bottom.\n"
+                "Return ONLY valid JSON with keys:\n"
+                '- "full_code": the complete updated Python file content from top to bottom\n'
+                '- "explanation": one concise sentence explaining the fix\n'
+                "(Or return a complete ```python code block containing the full updated file.)\n\n"
+                f"File content ({rel_posix}):\n```python\n{original_text}\n```"
+            )
+        else:
+            prompt = (
+                f"You are editing {rel_posix} to fix this issue:\n{issue_description}\n\n"
+                f"{notes_block}"
+                "Return ONLY valid JSON with keys:\n"
+                '- "old_code": contiguous block copied from the file\n'
+                '- "new_code": minimal clean replacement code\n'
+                '- "explanation": one concise sentence explaining the fix\n\n'
+                f"File content ({rel_posix}):\n```python\n{original_text[:20000]}\n```"
+            )
+
         res = self.llm.chat(
             [
                 {"role": "system", "content": DOLPHIN_SYSTEM_PROMPT},
@@ -365,25 +622,73 @@ class SelfCoder:
         )
         raw_content = res.get("content", "")
         parsed = _parse_json_object(raw_content)
-        old_code = str(parsed.get("old_code", ""))
-        new_code = str(parsed.get("new_code", ""))
         explanation = str(parsed.get("explanation", "")).strip()
 
-        if not old_code or old_code not in original_text:
+        old_code = ""
+        new_code = ""
+        full_code: str | None = None
+        updated_text: str | None = None
+        match_mode = "none"
+        match_similarity = 0.0
+
+        # 1. Explicit full_code JSON field or full-file small-target response
+        if parsed.get("full_code"):
+            full_code = _extract_full_code(raw_content, parsed, original_text, is_small_file=True)
+
+        # 2. Targeted old_code/new_code JSON replacement with verbatim or fuzzy matching
+        if full_code is None and parsed.get("old_code"):
+            raw_old = str(parsed.get("old_code", ""))
+            raw_new = str(parsed.get("new_code", ""))
+            matched_old, sim, mode = _find_matching_block(
+                original_text, raw_old, min_similarity=MIN_FUZZY_SIMILARITY
+            )
+            if matched_old is not None:
+                applied_new = _reindent_replacement(matched_old, raw_old, raw_new) if mode == "fuzzy" else raw_new
+                old_code = matched_old
+                new_code = applied_new
+                updated_text = original_text.replace(matched_old, applied_new, 1)
+                match_mode = mode
+                match_similarity = sim
+
+        # 3. Unified/fenced diff fallback (verbatim or fuzzy)
+        if full_code is None and updated_text is None:
             diff_old, diff_new = _extract_patch_from_diff(raw_content, original_text)
             if diff_old:
-                old_code, new_code = diff_old, diff_new
+                old_code = diff_old
+                new_code = diff_new
+                updated_text = original_text.replace(diff_old, diff_new, 1)
+                match_mode = "diff"
+                match_similarity = 1.0
 
-        if not old_code or old_code not in original_text:
+        # 4. Small-file whole-file fallback (`new_code` only or ```python ...``` fence)
+        if full_code is None and updated_text is None and is_small_file:
+            full_code = _extract_full_code(raw_content, parsed, original_text, is_small_file=True)
+
+        if full_code is not None:
+            if full_code == original_text:
+                return {
+                    "blocked": False,
+                    "error": f"Generated full_code made no changes to {rel_posix}.",
+                    "file": rel_posix,
+                    "risk_level": "LOW",
+                    "issue": issue_description,
+                }
+            hunk_old, hunk_new = _minimal_hunk_pair(original_text, full_code)
+            old_code = hunk_old
+            new_code = hunk_new
+            updated_text = full_code
+            match_mode = "full_file"
+            match_similarity = 1.0
+
+        if updated_text is None:
             return {
                 "blocked": False,
-                "error": f"Generated old_code did not match {rel_posix} verbatim.",
+                "error": f"Generated old_code did not match {rel_posix} (verbatim or fuzzy >= 85%).",
                 "file": rel_posix,
                 "risk_level": "HIGH",
                 "issue": issue_description,
             }
 
-        updated_text = original_text.replace(old_code, new_code, 1)
         diff_lines = difflib.unified_diff(
             original_text.splitlines(keepends=True),
             updated_text.splitlines(keepends=True),
@@ -392,8 +697,17 @@ class SelfCoder:
         )
         diff_text = "".join(diff_lines)
         risk_level = self.classify_risk(rel_posix, old_code, new_code)
+        policy_decision = self.evaluate_policy(rel_posix, risk_level, approved=False)
+        if policy_decision.outcome == PolicyOutcome.BLOCK:
+            return {
+                "blocked": True,
+                "error": policy_decision.reason,
+                "file": rel_posix,
+                "risk_level": risk_level,
+                "issue": issue_description,
+            }
 
-        return {
+        patch = {
             "blocked": False,
             "error": "",
             "file": rel_posix,
@@ -403,10 +717,27 @@ class SelfCoder:
             "explanation": explanation,
             "risk_level": risk_level,
             "issue": issue_description,
+            "match_mode": match_mode,
+            "match_similarity": match_similarity,
+            "policy_outcome": policy_decision.outcome.value,
         }
+        if full_code is not None:
+            patch["full_code"] = full_code
+            patch["full_file"] = True
+            patch["original_text"] = original_text
+        return patch
 
-    def _verify_patch(self, rel_posix: str, updated_text: str, test_res: subprocess.CompletedProcess):
-        """Verify syntax compilation and pytest result through auronix.verification.verifier.Verifier."""
+    def _verify_patch(
+        self,
+        rel_posix: str,
+        updated_text: str,
+        test_res: subprocess.CompletedProcess,
+        *,
+        match_mode: str = "exact",
+        match_similarity: float = 1.0,
+        policy_decision: PolicyDecision | None = None,
+    ):
+        """Verify syntax compilation, policy status, and pytest result through Verifier."""
         task = Task(
             task_id=f"selfcode-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}",
             goal=f"Verify patch for {rel_posix}",
@@ -420,7 +751,13 @@ class SelfCoder:
         )
         syntax_ok = False
         anomalies: list[str] = []
-        evidence: list[str] = []
+        evidence: list[str] = [f"patch match ({match_mode}, similarity={match_similarity:.2f})"]
+        if policy_decision is not None:
+            if policy_decision.outcome == PolicyOutcome.BLOCK:
+                anomalies.append(f"Policy blocked: {policy_decision.reason}")
+            else:
+                evidence.append(f"policy {policy_decision.outcome.value}")
+
         try:
             compile(updated_text, rel_posix, "exec")
             syntax_ok = True
@@ -480,13 +817,9 @@ class SelfCoder:
             return review
 
         original_text = target_abs.read_text(encoding="utf-8")
-        old_code = str(patch.get("old_code", ""))
-        new_code = str(patch.get("new_code", ""))
-        patched_text = (
-            original_text.replace(old_code, new_code, 1)
-            if old_code and old_code in original_text
-            else new_code
-        )
+        patched_text, _, _ = _resolve_patch_application(original_text, patch)
+        if patched_text is None:
+            patched_text = str(patch.get("full_code") or patch.get("new_code") or "")
         review = self.reviewer.review_patch(
             original_text,
             patched_text,
@@ -516,20 +849,17 @@ class SelfCoder:
             print(f"[self_coder] blocked forbidden patch target: {rel_posix}")
             return False
 
-        decision = self.evaluate_policy(rel_posix, risk_level, approved=True)
-        if decision.outcome == PolicyOutcome.BLOCK:
-            self.logger.warn(f"Policy blocked patch for {rel_posix}: {decision.reason}")
+        approved_flag = patch.get("policy_approved", True)
+        decision = self.evaluate_policy(rel_posix, risk_level, approved=bool(approved_flag))
+        if decision.outcome != PolicyOutcome.ALLOW:
+            self.logger.warn(f"Policy gated patch for {rel_posix} ({decision.outcome.value}): {decision.reason}")
             print(f"[self_coder] policy blocked patch for {rel_posix}: {decision.reason}")
             return False
 
-        old_code = str(patch.get("old_code", ""))
-        new_code = str(patch.get("new_code", ""))
-        if not old_code:
-            return False
-
         current_text = target_abs.read_text(encoding="utf-8")
-        if old_code not in current_text:
-            self.logger.warn(f"old_code no longer matches {rel_posix}")
+        updated_text, match_mode, match_similarity = _resolve_patch_application(current_text, patch)
+        if updated_text is None:
+            self.logger.warn(f"old_code no longer matches {rel_posix} (similarity={match_similarity:.2f})")
             print(f"[self_coder] old_code no longer matches {rel_posix}")
             return False
 
@@ -539,12 +869,14 @@ class SelfCoder:
         backup_path = self.backup_dir / f"{stamp}_{target_abs.name}.bak"
         shutil.copy2(target_abs, backup_path)
         self.last_backup_path = backup_path
-        self.logger.info(f"Created pre-patch snapshot for {rel_posix} at {backup_path}")
+        self.logger.info(
+            f"Created pre-patch snapshot for {rel_posix} at {backup_path} "
+            f"(mode={match_mode}, similarity={match_similarity:.2f})"
+        )
 
         target_label = str(patch.get("issue") or rel_posix)
 
         # 2. CodeReviewer check (unless already reviewed & approved in this pipeline pass)
-        updated_text = current_text.replace(old_code, new_code, 1)
         if not patch.get("_reviewed_approved"):
             review = self.reviewer.review_patch(current_text, updated_text, str(patch.get("issue", "")))
             self.last_review = review
@@ -559,10 +891,30 @@ class SelfCoder:
                 )
                 return False
 
-        # 3. Apply patch safely
+        # 3. Pre-flight syntax check before writing/executing pytest
+        try:
+            compile(updated_text, rel_posix, "exec")
+        except SyntaxError as exc:
+            syntax_fail_res = subprocess.CompletedProcess(
+                self.test_cmd, returncode=1, stdout="", stderr=f"SyntaxError: {exc}"
+            )
+            self._verify_patch(
+                rel_posix,
+                updated_text,
+                syntax_fail_res,
+                match_mode=match_mode,
+                match_similarity=match_similarity,
+                policy_decision=decision,
+            )
+            shutil.copy2(backup_path, target_abs)
+            self.logger.error(f"SyntaxError in proposed patch for {rel_posix}: {exc}; restored {backup_path}")
+            self._record_coding_outcome(applied=False, target=target_label, details=f"SyntaxError: {exc}")
+            return False
+
+        # 4. Apply patch safely
         target_abs.write_text(updated_text, encoding="utf-8")
 
-        # 4. Verify with pytest and auronix.verification.verifier.Verifier
+        # 5. Verify with pytest and auronix.verification.verifier.Verifier
         test_res = subprocess.run(
             self.test_cmd,
             cwd=str(self.repo_root),
@@ -570,9 +922,16 @@ class SelfCoder:
             text=True,
             check=False,
         )
-        verification = self._verify_patch(rel_posix, updated_text, test_res)
+        verification = self._verify_patch(
+            rel_posix,
+            updated_text,
+            test_res,
+            match_mode=match_mode,
+            match_similarity=match_similarity,
+            policy_decision=decision,
+        )
         if not verification.passed or test_res.returncode != 0:
-            # 5. Restore exact pre-patch snapshot without git reset
+            # 6. Restore exact pre-patch snapshot without git reset
             shutil.copy2(backup_path, target_abs)
             self.logger.error(f"Verification/pytest failed for {rel_posix}; restored backup from {backup_path}")
             self._record_coding_outcome(
@@ -583,21 +942,35 @@ class SelfCoder:
             print(f"[self_coder] tests failed after patching {rel_posix}; restored backup from {backup_path}.")
             return False
 
-        # 6. Log successful verified self-update and persist learning outcome
+        # 7. Log successful verified self-update and persist learning outcome
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        diff_summary = patch.get("diff", "")
+        if not diff_summary:
+            diff_summary = "".join(
+                difflib.unified_diff(
+                    current_text.splitlines(keepends=True),
+                    updated_text.splitlines(keepends=True),
+                    fromfile=f"a/{rel_posix}",
+                    tofile=f"b/{rel_posix}",
+                )
+            )
         entry = (
             f"[{datetime.datetime.now().isoformat()}] "
             f"risk={risk_level or patch.get('risk_level', 'UNKNOWN')} "
             f"file={rel_posix} "
+            f"mode={match_mode} "
+            f"similarity={match_similarity:.2f} "
             f"verification_id={verification.verification_id} "
             f"backup={backup_path} "
             f"issue={patch.get('issue', '')!r} "
             f"explanation={patch.get('explanation', '')!r}\n"
-            f"{patch.get('diff', '')}\n"
+            f"{diff_summary}\n"
         )
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(entry)
-        self.logger.info(f"Applied verified {risk_level} patch to {rel_posix} ({verification.verification_id})")
+        self.logger.info(
+            f"Applied verified {risk_level} patch ({match_mode}) to {rel_posix} ({verification.verification_id})"
+        )
         self._record_coding_outcome(
             applied=True,
             target=target_label,

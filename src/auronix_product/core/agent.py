@@ -1,6 +1,7 @@
 """Agent with deterministic router, undo, and voice confirmation."""
 
 from __future__ import annotations
+import datetime
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,11 @@ import subprocess
 import sys
 import threading
 import time
+from dateutil import parser as _date_parser
 import numpy as np
 from auronix.policy.engine import PolicyOutcome
 from .. import config
-from ..briefing import BriefingBuilder
+from ..briefing import BriefingBuilder, calendar as _briefing_calendar, system_status as _briefing_system_status
 from ..brain.client import LLM, LLMError, is_refusal
 from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.context_tracker import ConversationContext
@@ -30,7 +32,7 @@ from ..actions.handlers import open_app, search_web
 from ..actions.router import copy_to_clipboard, execute_open, execute_search, quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
-from ..skills import ResearchSkill, SelfCoder
+from ..skills import KnowledgeSkill, ResearchSkill, SelfCoder, VisionSkill
 
 _EMOJI_RE = _re.compile(EMOJI_RE_PATTERN, flags=_re.UNICODE)
 
@@ -77,9 +79,34 @@ _REASONING_RE = _re.compile(
 )
 
 _MEMORY_QUERY_RE = _re.compile(
-    r"(?:\bwhat did we work on\b|\byesterday\b.*\bwork|\blast thing we researched\b|"
-    r"\blast research\b|\bwhat did we research\b|\bsearch memory\b|"
-    r"\bwhat do you remember about\b)",
+    r"(?:\bwhat did we work on\b|\byesterday\b.*\bwork|\blast thing (?:we|i) researched\b|"
+    r"\blast research\b|\bwhat (?:did|was|have) (?:we|i|the last thing).{0,20}research(?:ed)?\b|"
+    r"\bsearch memory\b|\bwhat do you remember about\b)",
+    _re.IGNORECASE,
+)
+
+_REMEMBER_FILE_RE = _re.compile(
+    r"^(?:please\s+|can\s+you\s+)?(?:remember|index|learn|read\s+and\s+remember|save)\s+(?:this\s+|the\s+)?file\s*:?\s+(.+)$",
+    _re.IGNORECASE,
+)
+_KNOWLEDGE_TOPIC_RE = _re.compile(
+    r"^(?:please\s+|tell\s+me\s+)?what\s+do\s+(?:i|we)\s+know\s+about\s+(.+?)[\s?.!]*$",
+    _re.IGNORECASE,
+)
+_RESEARCH_CMD_RE = _re.compile(
+    r"^(?:please\s+)?(?:research(?:\s+karo)?\b|search\s+and\s+summarize\b|find\s+info(?:rmation)?\s+(?:about|on)\b)",
+    _re.IGNORECASE,
+)
+_CODE_FIX_PHRASING_RE = _re.compile(
+    r"^(?:fix|bug|issue|error|crash|broken|add|update|change|modify|remove|refactor|when|while|if)\b",
+    _re.IGNORECASE,
+)
+
+_VISION_SKILL_RE = _re.compile(
+    r"(?:\bwhat\s+(?:is|'s)\s+on\s+(?:(?:my|the)\s+)?screen\b|"
+    r"\banaly[sz]e\s+(?:(?:my|the)\s+)?screen\b|"
+    r"\b(?:what|read|check|explain|diagnose)\s+(?:the\s+|is\s+)?errors?\s+(?:is\s+)?on\s+(?:(?:my|the)\s+)?screen\b|"
+    r"\bscreen\s+dekho\b)",
     _re.IGNORECASE,
 )
 
@@ -102,6 +129,106 @@ class PendingIntent:
 
     def expired(self) -> bool:
         return time.time() > self.expires_at
+
+
+class ProactiveMonitor:
+    """Background proactive monitor checking battery and upcoming calendar meetings every 15 minutes."""
+
+    DEFAULT_INTERVAL_SECONDS = 900.0  # 15 minutes
+
+    def __init__(
+        self,
+        tts: TTS,
+        interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
+        logger=None,
+    ):
+        self.tts = tts
+        self.interval_seconds = float(interval_seconds)
+        self.logger = logger or get_logger("auronix.proactive")
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._notified_events: set[str] = set()
+        self._battery_alerted = False
+
+    @staticmethod
+    def _parse_event_start(event_text: str, ref_now: datetime.datetime) -> tuple[str, datetime.datetime] | None:
+        m = _re.match(r"^(.*?)\s+at\s+(.+)$", event_text.strip(), _re.IGNORECASE)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        time_raw = m.group(2).strip()
+        try:
+            dt = _date_parser.parse(time_raw, default=ref_now.replace(second=0, microsecond=0))
+        except Exception:
+            return None
+        return name or "upcoming meeting", dt
+
+    def check_once(self, now: datetime.datetime | None = None) -> list[str]:
+        """Run battery and calendar proximity checks once, speaking any triggered alerts."""
+        alerts: list[str] = []
+        ref_now = now or datetime.datetime.now()
+
+        # 1. Low battery check (< 15% and not charging)
+        try:
+            status = _briefing_system_status.get_system_status(ttl=0.0)
+            batt = status.get("battery_percent")
+            plugged = status.get("plugged_in")
+            if batt is not None and batt < 15 and plugged is False:
+                if not self._battery_alerted:
+                    msg = "Boss, battery is low."
+                    alerts.append(msg)
+                    self._battery_alerted = True
+                    self.logger.warn(f"Proactive battery alert: {batt}% (not charging)")
+                    self.tts.speak_async(msg)
+                    notify_alert("Auronix Power", msg)
+            else:
+                self._battery_alerted = False
+        except Exception as exc:
+            self.logger.error(f"Proactive battery check failed: {exc}")
+
+        # 2. Upcoming calendar event within 5 minutes
+        try:
+            cal = _briefing_calendar.get_today_events()
+            for ev in cal.get("events", []) or []:
+                parsed = self._parse_event_start(str(ev), ref_now)
+                if parsed is None:
+                    continue
+                ev_name, start_dt = parsed
+                delta_sec = (start_dt - ref_now).total_seconds()
+                if 0 <= delta_sec <= 330:
+                    key = f"{ev_name}|{start_dt.strftime('%H:%M')}"
+                    if key not in self._notified_events:
+                        self._notified_events.add(key)
+                        msg = f"Boss, your meeting {ev_name} starts in 5 minutes."
+                        alerts.append(msg)
+                        self.logger.info(f"Proactive calendar alert: {ev_name} at {start_dt.strftime('%I:%M %p')}")
+                        self.tts.speak_async(msg)
+                        notify_alert("Auronix Calendar", msg)
+        except Exception as exc:
+            self.logger.error(f"Proactive calendar check failed: {exc}")
+
+        return alerts
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.check_once()
+            except Exception as exc:
+                self.logger.error(f"Proactive monitor loop error: {exc}")
+            self._stop_event.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="auronix-proactive")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
 
 class Agent:
@@ -144,6 +271,16 @@ class Agent:
             coder_model=config.OLLAMA_DOLPHIN_MODEL,
             memory=self.memory,
         )
+        self.vision_skill = VisionSkill(
+            llm=self.llm,
+            model=config.OLLAMA_VISION_MODEL,
+        )
+        self.knowledge_skill = KnowledgeSkill(
+            db_path=self.memory.db_path.parent / "knowledge.db",
+            llm=self.llm,
+            memory=self.memory,
+        )
+        self.proactive_monitor = ProactiveMonitor(tts=self.tts, logger=self.logger)
         self.logger.info("Auronix Agent initialized (Stage 6 unified memory & logging active)")
         self.menubar = None
         self.set_menubar_state = lambda _state: None
@@ -313,9 +450,43 @@ class Agent:
         notify_result("Auronix Research", summary[:160])
         return summary
 
+    def _is_new_command_override(self, text: str, pending_type: str) -> bool:
+        """Detect when user abandons a pending follow-up prompt by issuing a clear new command."""
+        clean = _re.sub(
+            r"^(?:hey\s+)?(?:auronix|aaronix|ironix)[,:\s]+(?=\S)",
+            "",
+            text.strip(),
+            flags=_re.IGNORECASE,
+        ).strip()
+        lower = clean.lower().rstrip(".!?, ")
+        if not lower:
+            return False
+
+        if _REMEMBER_FILE_RE.match(clean) or _KNOWLEDGE_TOPIC_RE.match(clean):
+            return True
+        if _RESEARCH_CMD_RE.match(lower) or _MEMORY_QUERY_RE.search(lower) or _VISION_SKILL_RE.search(lower):
+            return True
+
+        # During code_fix pending input, keep descriptions phrased like bug reports ("fix weather pattern...")
+        if pending_type == "code_fix" and _CODE_FIX_PHRASING_RE.match(lower):
+            return False
+
+        # Any unambiguous deterministic router command clears the stale pending intent
+        try:
+            routed = quick_route(clean, self.memory)
+        except Exception:
+            routed = None
+        return routed is not None
+
     def _try_fast_path(self, text: str, text_mode: bool = True) -> tuple[bool, str]:
         """Handle continuous mode, confirmations, model switching, memory resets, and quick_route."""
-        lower_clean = text.lower().strip().rstrip(".!?, ")
+        stripped_text = _re.sub(
+            r"^(?:hey\s+)?(?:auronix|aaronix|ironix)[,:\s]+(?=\S)",
+            "",
+            text.strip(),
+            flags=_re.IGNORECASE,
+        ).strip()
+        lower_clean = stripped_text.lower().rstrip(".!?, ")
 
         # START CONTINUOUS MODE (don't swallow "<App> chalu karo")
         start_phrases = (
@@ -381,33 +552,58 @@ class Agent:
             self.memory.clear_messages()
             return True, "Forgotten. Fresh start."
 
-        # Active pending intent check BEFORE routing / LLM (executes follow-up target directly)
+        # Active pending intent check BEFORE routing / LLM (executes follow-up target unless user issued a new command)
+        raw_trimmed = text.strip()
         if self.pending_intent is not None:
             if self.pending_intent.expired():
                 self.pending_intent = None
             else:
-                lower_pi = text.lower().strip().rstrip(".!?, ")
+                lower_pi = raw_trimmed.lower().rstrip(".!?, ")
                 if lower_pi in NO_WORDS or lower_pi in ("never mind", "cancel"):
                     self.pending_intent = None
                     return True, "Cancelled."
-                if self.pending_intent.type == "search":
+                if self._is_new_command_override(raw_trimmed, self.pending_intent.type):
+                    self.logger.info(
+                        f"Clearing pending_intent={self.pending_intent.type} for new command: {raw_trimmed!r}"
+                    )
                     self.pending_intent = None
-                    res = execute_search(text.strip())
+                elif self.pending_intent.type == "search":
+                    self.pending_intent = None
+                    res = execute_search(raw_trimmed)
                     sfx.play_success()
                     notify_result("Auronix", res[:160])
                     return True, res
-                if self.pending_intent.type == "open_app":
+                elif self.pending_intent.type == "open_app":
                     self.pending_intent = None
-                    res = execute_open(text.strip())
+                    res = execute_open(raw_trimmed)
                     sfx.play_success()
                     notify_result("Auronix", res[:160])
                     return True, res
-                if self.pending_intent.type == "research":
+                elif self.pending_intent.type == "research":
                     self.pending_intent = None
-                    return True, self._run_research(text.strip(), announce=not text_mode)
-                if self.pending_intent.type == "code_fix":
+                    return True, self._run_research(raw_trimmed, announce=not text_mode)
+                elif self.pending_intent.type == "code_fix":
                     self.pending_intent = None
-                    return True, self._handle_code_fix_issue(text.strip(), announce=not text_mode)
+                    return True, self._handle_code_fix_issue(raw_trimmed, announce=not text_mode)
+
+        # Explicit Knowledge RAG commands ("Remember this file: ...", "What do I know about ...")
+        rem_file_m = _REMEMBER_FILE_RE.match(stripped_text)
+        if rem_file_m:
+            file_arg = rem_file_m.group(1).strip().rstrip(".")
+            info = self.knowledge_skill.index_document(file_arg)
+            res = _strip_emoji(info.get("message", "Done."))
+            sfx.play_success() if info.get("ok") else sfx.play_error()
+            notify_result("Auronix Knowledge", res[:160])
+            return True, res
+
+        know_m = _KNOWLEDGE_TOPIC_RE.match(stripped_text)
+        if know_m:
+            topic = know_m.group(1).strip().rstrip("?.! ")
+            hits = self.knowledge_skill.query_knowledge(topic)
+            res = _strip_emoji(self.knowledge_skill.answer_question(topic, hits=hits))
+            sfx.play_success()
+            notify_result("Auronix Knowledge", res[:160])
+            return True, res
 
         # Explicit user confirmation for proposed AppleScript fix
         if lower_clean == "run fix":
@@ -450,8 +646,12 @@ class Agent:
 
         if routed is not None and routed.response == "__VISION_READ__":
             print("[vision] Capturing screen and analyzing...")
-            from ..actions.handlers import read_screen_content
-            res = _strip_emoji(read_screen_content(self.llm))
+            if _VISION_SKILL_RE.search(text):
+                res = _strip_emoji(self.vision_skill.analyze_screen(text))
+            else:
+                from ..actions.handlers import read_screen_content
+
+                res = _strip_emoji(read_screen_content(self.llm))
             sfx.play_success()
             notify_result("Auronix", res[:160])
             return True, res
@@ -459,6 +659,22 @@ class Agent:
         if routed is not None and routed.response.startswith("__RESEARCH__:"):
             query = routed.response.split(":", 1)[1].strip()
             return True, self._run_research(query, announce=not text_mode)
+
+        if routed is not None and routed.response.startswith("__KNOWLEDGE_INDEX__:"):
+            file_arg = routed.response.split(":", 1)[1].strip()
+            info = self.knowledge_skill.index_document(file_arg)
+            res = _strip_emoji(info.get("message", "Done."))
+            sfx.play_success() if info.get("ok") else sfx.play_error()
+            notify_result("Auronix Knowledge", res[:160])
+            return True, res
+
+        if routed is not None and routed.response.startswith("__KNOWLEDGE_QUERY__:"):
+            topic = routed.response.split(":", 1)[1].strip()
+            hits = self.knowledge_skill.query_knowledge(topic)
+            res = _strip_emoji(self.knowledge_skill.answer_question(topic, hits=hits))
+            sfx.play_success()
+            notify_result("Auronix Knowledge", res[:160])
+            return True, res
 
         if routed is not None:
             self.logger.info(f"quick_route handled command -> {routed.response[:80]!r}")
@@ -509,6 +725,22 @@ class Agent:
             self.set_menubar_state("error")
             notify_alert("Auronix Error", str(e))
             return f"Something went wrong: {e}"
+
+    def process_text(self, text: str) -> str:
+        """Process a single headless text command (used by FastAPI/WebSocket APIs) without terminal loop."""
+        clean = str(text or "").strip()
+        if not clean:
+            return ""
+        self.logger.info(f"API command: {clean!r}")
+        response = self._process(clean)
+        if response:
+            try:
+                self.memory.add_message("user", clean)
+                self.memory.add_message("assistant", response)
+            except Exception as exc:
+                self.logger.warn(f"Skipped persisting headless turn: {exc}")
+            self._record_context(clean, response)
+        return response
 
     def _record_context(self, user_text: str, response: str) -> None:
         """Update short-term ConversationContext with latest turn and active app."""
@@ -736,6 +968,8 @@ class Agent:
             self.set_menubar_state("idle")
 
         self.scheduler.start()
+        if not text_mode:
+            self.proactive_monitor.start()
         try:
             while True:
                 current = self.llm.model
@@ -862,6 +1096,7 @@ class Agent:
         finally:
             print("\nAuronix stopped.")
             self.scheduler.stop()
+            self.proactive_monitor.stop()
             if hasattr(self, "wake_detector") and self.wake_detector:
                 self.wake_detector.close()
             if getattr(self, "menubar", None) is not None:
