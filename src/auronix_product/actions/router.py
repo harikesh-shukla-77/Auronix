@@ -24,7 +24,7 @@ from .patterns import (
     _LIST_REMIND_PATTERNS, _CANCEL_REMIND_PATTERNS, _TIMER_IN_PATTERNS,
     _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
     _CALENDAR_PATTERNS, _RESEARCH_PATTERNS, _SELF_FIX_PATTERNS,
-    _KNOWLEDGE_INDEX_PATTERNS, _KNOWLEDGE_QUERY_PATTERNS,
+    _KNOWLEDGE_INDEX_PATTERNS, _KNOWLEDGE_QUERY_PATTERNS, _SELF_IMPROVE_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
@@ -220,6 +220,9 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
             "What issue should I fix? Please describe the bug.",
             pending_intent="code_fix",
         )
+
+    if any(re.search(pat, lower) for pat in _SELF_IMPROVE_PATTERNS):
+        return RoutedCommand("__SELF_IMPROVE__")
 
     raw_trimmed = stripped_wake
     for pat in _KNOWLEDGE_INDEX_PATTERNS:

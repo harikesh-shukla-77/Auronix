@@ -69,7 +69,14 @@ def create_app(agent: Agent | None = None) -> FastAPI:
             with state["agent_lock"]:
                 if state["agent"] is None:
                     logger.info("Initializing headless Auronix Agent for web server")
-                    state["agent"] = Agent()
+                    ag_inst = Agent()
+                    if "PYTEST_CURRENT_TEST" not in os.environ:
+                        try:
+                            ag_inst.resource_manager.start()
+                            ag_inst.self_improvement.start()
+                        except Exception as exc:
+                            logger.warn(f"Autonomous background monitors not started: {exc}")
+                    state["agent"] = ag_inst
         return state["agent"]
 
     app.state.get_agent = get_agent
@@ -118,9 +125,12 @@ def create_app(agent: Agent | None = None) -> FastAPI:
             db_connected = False
 
         sys_metrics = await anyio.to_thread.run_sync(get_system_status)
+        res_status = ag.resource_manager.status()
         return {
             "status": "online",
             "health": "ok" if db_connected else "degraded",
+            "resource_state": res_status["state"],
+            "resource_manager": res_status,
             "models": {
                 "gemini": {
                     "active": gemini_active,
@@ -173,6 +183,31 @@ def create_app(agent: Agent | None = None) -> FastAPI:
                     }
                 )
         return {"count": len(items), "items": items}
+
+    @app.get("/api/self_improvement")
+    def api_self_improvement(limit: int = 20) -> dict[str, Any]:
+        ag = get_agent()
+        logs = ag.self_improvement.get_logs(limit=limit)
+        res_state = ag.resource_manager.status()
+        return {
+            "resource_state": res_state["state"],
+            "resource_manager": res_state,
+            **logs,
+        }
+
+    @app.post("/api/self_improvement/run")
+    def api_self_improvement_run() -> dict[str, Any]:
+        ag = get_agent()
+        started = ag.self_improvement.trigger_now()
+        return {
+            "started": bool(started),
+            "running": bool(ag.self_improvement._active_run),
+            "message": (
+                "Self-improvement cycle started in background."
+                if started
+                else "A self-improvement cycle is already running."
+            ),
+        }
 
     @app.post("/api/voice/toggle")
     def api_voice_toggle(payload: VoiceToggleRequest) -> dict[str, Any]:

@@ -21,6 +21,7 @@ const statusOllamaEl = document.getElementById("status-ollama");
 const statusDolphinEl = document.getElementById("status-dolphin");
 const statusDbEl = document.getElementById("status-db");
 const statusWsEl = document.getElementById("status-ws");
+const statusResourceEl = document.getElementById("status-resource");
 
 const metricCpuEl = document.getElementById("metric-cpu");
 const metricRamEl = document.getElementById("metric-ram");
@@ -29,6 +30,10 @@ const metricDbSizeEl = document.getElementById("metric-db-size");
 
 const memoryListEl = document.getElementById("memory-list");
 const memoryCountEl = document.getElementById("memory-count");
+const evolutionListEl = document.getElementById("evolution-list");
+const evolutionCountEl = document.getElementById("evolution-count");
+const evolutionResourceStateEl = document.getElementById("evolution-resource-state");
+const selfImproveBtnEl = document.getElementById("self-improve-btn");
 const toggleTtsBtnEl = document.getElementById("toggle-tts-btn");
 const toggleDaemonBtnEl = document.getElementById("toggle-daemon-btn");
 const micInputBtnEl = document.getElementById("mic-input-btn");
@@ -103,6 +108,15 @@ async function fetchStatus() {
     const dbConn = Boolean(data.memory?.connected);
     setBadge(statusDbEl, dbConn ? "CONNECTED" : "DISCONNECTED", dbConn ? "ok" : "err");
 
+    const resState = String(data.resource_state || "Active");
+    const isSleeping = resState.toLowerCase().includes("sleep");
+    if (statusResourceEl) {
+      setBadge(statusResourceEl, resState.toUpperCase(), isSleeping ? "warn" : "ok");
+    }
+    if (evolutionResourceStateEl) {
+      setBadge(evolutionResourceStateEl, resState, isSleeping ? "warn" : "ok");
+    }
+
     const sys = data.system || {};
     metricCpuEl.textContent = sys.cpu_percent != null ? `${sys.cpu_percent}%` : "--%";
     metricRamEl.textContent = sys.memory_percent != null ? `${sys.memory_percent}%` : "--%";
@@ -165,6 +179,57 @@ async function fetchMemory() {
   }
 }
 
+async function fetchEvolution() {
+  if (!evolutionListEl) return;
+  try {
+    const resp = await fetch(`${API_BASE}/api/self_improvement?limit=5`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const items = (data.items || []).slice(0, 5);
+    if (evolutionCountEl) evolutionCountEl.textContent = String(items.length);
+
+    if (evolutionResourceStateEl && data.resource_state) {
+      const sleeping = String(data.resource_state).toLowerCase().includes("sleep");
+      setBadge(evolutionResourceStateEl, data.resource_state, sleeping ? "warn" : "ok");
+    }
+
+    evolutionListEl.innerHTML = "";
+    if (!items.length) {
+      evolutionListEl.innerHTML = '<div class="memory-empty">No Nightly Auto-Improvement cycles recorded yet.</div>';
+      return;
+    }
+
+    for (const item of items) {
+      const card = document.createElement("div");
+      card.className = "memory-card";
+
+      const top = document.createElement("div");
+      top.className = "memory-card-top";
+      const statusSpan = document.createElement("span");
+      statusSpan.textContent = String(item.status || "logged").toUpperCase();
+      const riskSpan = document.createElement("span");
+      riskSpan.textContent = String(item.risk_level || item.trigger || "LOW").toUpperCase();
+      top.appendChild(statusSpan);
+      top.appendChild(riskSpan);
+
+      const title = document.createElement("div");
+      title.className = "memory-card-title";
+      title.textContent = item.file ? `Nightly Auto-Improvement: ${item.file}` : "Nightly Auto-Improvement";
+
+      const body = document.createElement("div");
+      body.className = "memory-card-body";
+      body.textContent = item.memory_message || item.reason || "";
+
+      card.appendChild(top);
+      card.appendChild(title);
+      card.appendChild(body);
+      evolutionListEl.appendChild(card);
+    }
+  } catch {
+    evolutionListEl.innerHTML = '<div class="memory-empty">Failed to load Autonomous Evolution logs.</div>';
+  }
+}
+
 async function sendCommand(text) {
   const clean = (text || "").trim();
   if (!clean) return;
@@ -191,7 +256,7 @@ async function sendCommand(text) {
     appendMessage("assistant", replyText, engineTag);
     speakText(replyText);
 
-    await Promise.all([fetchStatus(), fetchMemory()]);
+    await Promise.all([fetchStatus(), fetchMemory(), fetchEvolution()]);
     setTimeout(() => setCoreState("idle", "READY"), 1200);
   } catch (err) {
     setCoreState("error", "ERROR");
@@ -243,6 +308,27 @@ document.querySelectorAll(".chip").forEach((btn) => {
 
 document.getElementById("refresh-status-btn").addEventListener("click", fetchStatus);
 document.getElementById("refresh-memory-btn").addEventListener("click", fetchMemory);
+const refreshEvolutionBtn = document.getElementById("refresh-evolution-btn");
+if (refreshEvolutionBtn) refreshEvolutionBtn.addEventListener("click", fetchEvolution);
+
+if (selfImproveBtnEl) {
+  selfImproveBtnEl.addEventListener("click", async () => {
+    selfImproveBtnEl.disabled = true;
+    try {
+      const resp = await fetch(`${API_BASE}/api/self_improvement/run`, { method: "POST" });
+      const data = await resp.json();
+      appendMessage("assistant", data.message || "Self-improvement cycle triggered.", "EVOLUTION");
+      setTimeout(() => {
+        fetchEvolution();
+        fetchMemory();
+      }, 2000);
+    } catch (err) {
+      appendMessage("assistant", `Self-improvement trigger failed: ${err.message}`, "ERROR");
+    } finally {
+      selfImproveBtnEl.disabled = false;
+    }
+  });
+}
 
 toggleTtsBtnEl.addEventListener("click", () => {
   browserTtsEnabled = !browserTtsEnabled;
@@ -292,8 +378,10 @@ micInputBtnEl.addEventListener("click", () => {
 
 fetchStatus();
 fetchMemory();
+fetchEvolution();
 connectWebSocket();
 setInterval(() => {
   fetchStatus();
   fetchMemory();
+  fetchEvolution();
 }, 15000);

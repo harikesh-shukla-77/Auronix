@@ -195,3 +195,10 @@ _KNOWLEDGE_QUERY_PATTERNS = [
     r"^(?:search|check)\s+my\s+(?:documents|docs|knowledge|notes)\s+(?:for|about)\s+(.+?)[\s?.!]*$",
 ]
 
+_SELF_IMPROVE_PATTERNS = [
+    r"\bimprove\s+yourself\b",
+    r"\bstart\s+self[- ]improvement\b",
+    r"\brun\s+self[- ]improvement\b",
+    r"\bkhud\s+ko\s+improve\s+karo\b",
+]
+

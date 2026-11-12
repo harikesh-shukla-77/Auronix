@@ -68,7 +68,14 @@ if [[ "${OPEN_BROWSER}" == "true" ]]; then
     open "${URL}" >/dev/null 2>&1 || true
 fi
 
-if [[ "${KEEPALIVE}" == "true" && -n "${UVICORN_PID}" ]]; then
-    wait "${UVICORN_PID}"
+if [[ "${KEEPALIVE}" == "true" ]]; then
+    if [[ -n "${UVICORN_PID}" ]]; then
+        wait "${UVICORN_PID}"
+        exit $?
+    fi
+    while lsof -i ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1; do
+        sleep 10
+    done
+    exit 1
 fi
 

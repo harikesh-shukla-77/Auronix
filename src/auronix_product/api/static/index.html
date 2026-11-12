@@ -44,6 +44,10 @@
             <span class="status-label">WebSocket Link</span>
             <span id="status-ws" class="badge badge-muted">CONNECTING</span>
           </div>
+          <div class="status-row">
+            <span class="status-label">Resource State</span>
+            <span id="status-resource" class="badge badge-ok">ACTIVE</span>
+          </div>
         </div>
 
         <div class="metrics-bar">
@@ -75,6 +79,20 @@
           <div class="memory-empty">Loading neural memory records...</div>
         </div>
       </section>
+
+      <section class="panel evolution-panel">
+        <div class="panel-header">
+          <h2>AUTONOMOUS EVOLUTION <span id="evolution-count" class="count-pill">0</span></h2>
+          <button id="refresh-evolution-btn" class="icon-btn" title="Reload evolution logs">↻</button>
+        </div>
+        <div class="status-row" style="margin-bottom: 8px;">
+          <span class="status-label">Resource State</span>
+          <span id="evolution-resource-state" class="badge badge-ok">Active</span>
+        </div>
+        <div id="evolution-list" class="memory-list">
+          <div class="memory-empty">No Nightly Auto-Improvement cycles recorded yet.</div>
+        </div>
+      </section>
     </aside>
 
     <!-- Main Core + Chat Stage -->
@@ -85,6 +103,9 @@
           <span id="core-state-text">AURONIX CORE: ONLINE</span>
         </div>
         <div class="top-actions">
+          <button id="self-improve-btn" class="hud-btn" title="Trigger background self-improvement loop">
+            ⚡ Start Self-Improvement (Background)
+          </button>
           <button id="toggle-tts-btn" class="hud-btn" title="Speak replies in browser">
             🔊 Voice Output: OFF
           </button>

@@ -20,6 +20,7 @@ from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.context_tracker import ConversationContext
 from ..core.logger import get_logger
 from ..core.memory import Memory
+from ..core.resource_manager import ResourceManager
 from ..voice import sfx
 from ..voice.audio_guard import is_barge_in_command, should_discard_transcript
 from ..voice.stt import STT
@@ -32,7 +33,7 @@ from ..actions.handlers import open_app, search_web
 from ..actions.router import copy_to_clipboard, execute_open, execute_search, quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
-from ..skills import KnowledgeSkill, ResearchSkill, SelfCoder, VisionSkill
+from ..skills import KnowledgeSkill, ResearchSkill, SelfCoder, SelfImprovementLoop, VisionSkill
 
 _EMOJI_RE = _re.compile(EMOJI_RE_PATTERN, flags=_re.UNICODE)
 
@@ -99,6 +100,10 @@ _RESEARCH_CMD_RE = _re.compile(
 )
 _CODE_FIX_PHRASING_RE = _re.compile(
     r"^(?:fix|bug|issue|error|crash|broken|add|update|change|modify|remove|refactor|when|while|if)\b",
+    _re.IGNORECASE,
+)
+_SELF_IMPROVE_RE = _re.compile(
+    r"\b(?:improve\s+yourself|start\s+self[- ]improvement|run\s+self[- ]improvement|khud\s+ko\s+improve\s+karo)\b",
     _re.IGNORECASE,
 )
 
@@ -279,6 +284,18 @@ class Agent:
             db_path=self.memory.db_path.parent / "knowledge.db",
             llm=self.llm,
             memory=self.memory,
+        )
+        self.resource_manager = ResourceManager(
+            llm=self.llm,
+            logger=self.logger,
+        )
+        self.self_improvement = SelfImprovementLoop(
+            self_coder=self.self_coder,
+            research_skill=self.research_skill,
+            memory=self.memory,
+            resource_manager=self.resource_manager,
+            log_path=self.memory.db_path.parent / "self_improvement_logs.jsonl",
+            logger=self.logger,
         )
         self.proactive_monitor = ProactiveMonitor(tts=self.tts, logger=self.logger)
         self.logger.info("Auronix Agent initialized (Stage 6 unified memory & logging active)")
@@ -464,6 +481,8 @@ class Agent:
 
         if _REMEMBER_FILE_RE.match(clean) or _KNOWLEDGE_TOPIC_RE.match(clean):
             return True
+        if _SELF_IMPROVE_RE.search(lower):
+            return True
         if _RESEARCH_CMD_RE.match(lower) or _MEMORY_QUERY_RE.search(lower) or _VISION_SKILL_RE.search(lower):
             return True
 
@@ -605,6 +624,17 @@ class Agent:
             notify_result("Auronix Knowledge", res[:160])
             return True, res
 
+        if _SELF_IMPROVE_RE.search(stripped_text):
+            started = self.self_improvement.trigger_now()
+            msg = (
+                "Autonomous self-improvement started in the background. I'll review, verify, and log any low-risk fix."
+                if started
+                else "A self-improvement cycle is already running in the background."
+            )
+            sfx.play_success()
+            notify_result("Auronix Self-Improvement", msg[:160])
+            return True, msg
+
         # Explicit user confirmation for proposed AppleScript fix
         if lower_clean == "run fix":
             from ..actions.handlers import run_pending_fix
@@ -700,6 +730,7 @@ class Agent:
 
     def _process(self, text: str) -> str:
         try:
+            self.resource_manager.ensure_awake()
             handled, response = self._try_fast_path(text)
             if handled:
                 return response
@@ -868,6 +899,7 @@ class Agent:
 
     def _execute_and_reply(self, user_text: str, text_mode: bool, is_split: bool = False) -> None:
         """Process one user utterance, persist the turn, and speak in voice mode."""
+        self.resource_manager.ensure_awake()
         self.logger.info(f"User utterance (text_mode={text_mode}): {user_text!r}")
         print(f"You: {user_text}")
         self.set_menubar_state("thinking")
@@ -970,6 +1002,8 @@ class Agent:
         self.scheduler.start()
         if not text_mode:
             self.proactive_monitor.start()
+            self.resource_manager.start()
+            self.self_improvement.start()
         try:
             while True:
                 current = self.llm.model
@@ -1097,6 +1131,8 @@ class Agent:
             print("\nAuronix stopped.")
             self.scheduler.stop()
             self.proactive_monitor.stop()
+            self.resource_manager.stop()
+            self.self_improvement.stop()
             if hasattr(self, "wake_detector") and self.wake_detector:
                 self.wake_detector.close()
             if getattr(self, "menubar", None) is not None:
