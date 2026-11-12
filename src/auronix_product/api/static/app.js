@@ -345,14 +345,8 @@ if (refreshEvolutionBtn) refreshEvolutionBtn.addEventListener("click", fetchEvol
 if (toggleLidClosedBtnEl) {
   toggleLidClosedBtnEl.addEventListener("click", async () => {
     const nextEnabled = !lidClosedEnabled;
-    if (
-      nextEnabled &&
-      !window.confirm(
-        "Warning: Always-On (Lid Closed) disables macOS sleep and drains battery when unplugged (requires sudo pmset permission). Enable?"
-      )
-    ) {
-      return;
-    }
+    toggleLidClosedBtnEl.disabled = true;
+    toggleLidClosedBtnEl.textContent = "🔐 Waiting for macOS Password...";
     try {
       const resp = await fetch(`${API_BASE}/api/power/toggle`, {
         method: "POST",
@@ -364,11 +358,28 @@ if (toggleLidClosedBtnEl) {
       toggleLidClosedBtnEl.textContent = `🔋 Always-On (Lid Closed): ${lidClosedEnabled ? "ON" : "OFF"}`;
       toggleLidClosedBtnEl.classList.toggle("active", lidClosedEnabled);
       if (powerBatteryWarningEl) {
-        powerBatteryWarningEl.style.display = lidClosedEnabled ? "block" : "none";
+        if (lidClosedEnabled) {
+          powerBatteryWarningEl.textContent =
+            data.warning || "Warning: Always-On (Lid Closed) prevents sleep and drains battery when unplugged.";
+          powerBatteryWarningEl.style.color = "#f59e0b";
+          powerBatteryWarningEl.style.display = "block";
+        } else if (!data.ok && (data.error || data.message)) {
+          powerBatteryWarningEl.textContent = data.error || data.message;
+          powerBatteryWarningEl.style.color = "#ef4444";
+          powerBatteryWarningEl.style.display = "block";
+        } else {
+          powerBatteryWarningEl.style.display = "none";
+        }
       }
-      appendMessage("assistant", data.message || "Power state updated.", data.ok ? "POWER" : "WARN");
+      const displayMsg = data.ok
+        ? data.message || "Power state updated."
+        : data.message || data.error || "Password was cancelled.";
+      appendMessage("assistant", displayMsg, data.ok ? "POWER" : "ERROR");
     } catch (err) {
+      toggleLidClosedBtnEl.textContent = `🔋 Always-On (Lid Closed): ${lidClosedEnabled ? "ON" : "OFF"}`;
       appendMessage("assistant", `Power toggle failed: ${err.message}`, "ERROR");
+    } finally {
+      toggleLidClosedBtnEl.disabled = false;
     }
   });
 }

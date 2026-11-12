@@ -1,4 +1,4 @@
-"""24/7 Lid-Closed power manager using explicit sudo pmset, caffeinate -i -m, and keepalive watchdog."""
+"""24/7 Lid-Closed power manager using macOS osascript administrator privileges for pmset, caffeinate -i -m, and keepalive watchdog."""
 
 from __future__ import annotations
 
@@ -17,8 +17,15 @@ BATTERY_DRAIN_WARNING = (
 )
 
 
+def _format_osascript_error(err_txt: str) -> str:
+    lowered = err_txt.lower()
+    if "user canceled" in lowered or "user cancelled" in lowered or "-128" in lowered:
+        return "Password was cancelled"
+    return err_txt or "Administrator authentication failed"
+
+
 class PowerManager:
-    """Manages macOS lid-closed wakefulness with explicit sudo pmset and caffeinate keepalive."""
+    """Manages macOS lid-closed wakefulness via osascript GUI admin pmset and caffeinate keepalive."""
 
     def __init__(
         self,
@@ -46,13 +53,14 @@ class PowerManager:
         self._caffeinate_proc: Any = None
 
     def _run_pmset(self, disablesleep_val: int) -> subprocess.CompletedProcess:
-        sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
-        pmset_bin = shutil.which("pmset") or "/usr/bin/pmset"
+        osascript_bin = shutil.which("osascript") or "osascript"
+        val = 1 if int(disablesleep_val) else 0
+        script = f'do shell script "pmset -a disablesleep {val}" with administrator privileges'
         return self._runner(
-            [sudo_bin, "-n", pmset_bin, "-a", "disablesleep", str(disablesleep_val)],
+            [osascript_bin, "-e", script],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=120,
             check=False,
         )
 
@@ -99,34 +107,41 @@ class PowerManager:
                 self.logger.warn(f"PowerManager watchdog check failed: {exc}")
 
     def enable_lid_closed_mode(self) -> dict[str, Any]:
-        """Enable 24/7 lid-closed persistence using explicit sudo pmset -a disablesleep 1 + caffeinate."""
+        """Enable 24/7 lid-closed persistence via osascript administrator prompt (pmset -a disablesleep 1) + caffeinate."""
         with self._lock:
             try:
                 res = self._run_pmset(1)
             except Exception as exc:
-                self.last_error = str(exc)
+                err_msg = (
+                    "Administrator password prompt timed out"
+                    if isinstance(exc, subprocess.TimeoutExpired)
+                    else f"Failed to execute osascript pmset: {exc}"
+                )
+                self.last_error = err_msg
                 return {
                     "ok": False,
                     "enabled": self.lid_closed_enabled,
                     "needs_sudo": True,
                     "warning": BATTERY_DRAIN_WARNING,
-                    "error": self.last_error,
-                    "message": f"Failed to execute sudo pmset: {exc}",
+                    "error": err_msg,
+                    "message": err_msg,
                 }
 
             if res.returncode != 0:
-                err_txt = (res.stderr or res.stdout or "sudo permission required").strip()
-                self.last_error = err_txt
-                self.logger.warn(f"pmset disablesleep 1 denied: {err_txt}")
+                raw_err = (res.stderr or res.stdout or "Administrator authentication required").strip()
+                friendly_err = _format_osascript_error(raw_err)
+                self.last_error = friendly_err
+                self.logger.warn(f"osascript pmset disablesleep 1 failed: {raw_err}")
                 return {
                     "ok": False,
                     "enabled": False,
                     "needs_sudo": True,
                     "warning": BATTERY_DRAIN_WARNING,
-                    "error": err_txt,
+                    "error": friendly_err,
                     "message": (
-                        "Explicit sudo permission is required for lid-closed mode. "
-                        "Run 'sudo pmset -a disablesleep 1' in Terminal or allow sudoers pmset access."
+                        "Password was cancelled. Always-On (Lid Closed) was not enabled."
+                        if friendly_err == "Password was cancelled"
+                        else f"Could not enable Always-On (Lid Closed): {friendly_err}"
                     ),
                 }
 
@@ -151,7 +166,7 @@ class PowerManager:
             }
 
     def disable_lid_closed_mode(self) -> dict[str, Any]:
-        """Restore standard macOS sleep (sudo pmset -a disablesleep 0) and stop caffeinate."""
+        """Restore standard macOS sleep via osascript administrator prompt (pmset -a disablesleep 0) and stop caffeinate."""
         with self._lock:
             self._stop_event.set()
             if self._monitor_thread is not None:
@@ -162,25 +177,32 @@ class PowerManager:
             try:
                 res = self._run_pmset(0)
                 ok = res.returncode == 0
-                err_txt = (res.stderr or res.stdout or "").strip()
+                raw_err = (res.stderr or res.stdout or "").strip()
+                friendly_err = "" if ok else _format_osascript_error(raw_err)
             except Exception as exc:
                 ok = False
-                err_txt = str(exc)
+                friendly_err = (
+                    "Administrator password prompt timed out"
+                    if isinstance(exc, subprocess.TimeoutExpired)
+                    else str(exc)
+                )
 
             self.lid_closed_enabled = False
             self.last_warning = ""
-            self.last_error = "" if ok else err_txt
+            self.last_error = "" if ok else friendly_err
             self.logger.info(f"Disabled 24/7 lid-closed persistence (pmset_ok={ok})")
+            if ok:
+                msg = "Always-On (Lid Closed) disabled; normal macOS sleep restored."
+            elif friendly_err == "Password was cancelled":
+                msg = "Password was cancelled; stopped caffeinate, but macOS sleep was not restored."
+            else:
+                msg = f"Stopped caffeinate, but pmset reset failed: {friendly_err}"
             return {
                 "ok": ok,
                 "enabled": False,
                 "warning": "",
                 "error": self.last_error,
-                "message": (
-                    "Always-On (Lid Closed) disabled; normal macOS sleep restored."
-                    if ok
-                    else f"Stopped caffeinate, but pmset reset needed sudo: {err_txt}"
-                ),
+                "message": msg,
             }
 
     def stop(self) -> None:

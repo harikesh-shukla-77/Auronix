@@ -226,9 +226,27 @@ def create_app(agent: Agent | None = None) -> FastAPI:
     @app.post("/api/power/toggle")
     def api_power_toggle(payload: VoiceToggleRequest) -> dict[str, Any]:
         ag = get_agent()
-        if payload.enabled:
-            return ag.power_manager.enable_lid_closed_mode()
-        return ag.power_manager.disable_lid_closed_mode()
+        try:
+            result = (
+                ag.power_manager.enable_lid_closed_mode()
+                if payload.enabled
+                else ag.power_manager.disable_lid_closed_mode()
+            )
+        except Exception as exc:
+            logger.error(f"Power toggle raised exception: {exc}")
+            return {
+                "ok": False,
+                "enabled": bool(getattr(ag.power_manager, "lid_closed_enabled", False)),
+                "error": str(exc),
+                "message": f"Power toggle failed: {exc}",
+            }
+
+        if not result.get("ok"):
+            err = str(result.get("error") or result.get("message") or "Password was cancelled")
+            result["error"] = err
+            if not result.get("message"):
+                result["message"] = err
+        return result
 
     @app.post("/api/dream/run")
     def api_dream_run() -> dict[str, Any]:

@@ -42,21 +42,25 @@ def test_stage12_power_manager_toggles_and_dashboard_api(tmp_path, monkeypatch):
     res_on = pm.enable_lid_closed_mode()
     assert res_on["ok"] is True and res_on["enabled"] is True
     assert "drains battery" in res_on["warning"].lower()
-    assert "pmset" in calls[0][2] and calls[0][-3:] == ["-a", "disablesleep", "1"]
+    assert "osascript" in calls[0][0]
+    assert calls[0][1:] == ["-e", 'do shell script "pmset -a disablesleep 1" with administrator privileges']
     assert "caffeinate" in popens[0][0] and "-i" in popens[0] and "-m" in popens[0]
 
-    # Sudo denial fails closed and never pretends Always-On is active
+    # Cancelling macOS password prompt fails closed and returns clear error
     denied_pm = PowerManager(
-        runner=lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="sudo: a password is required"),
+        runner=lambda cmd, **_kw: subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="execution error: User canceled. (-128)"),
         popen_fn=lambda cmd, **_kw: _FakeProc(cmd),
     )
     res_denied = denied_pm.enable_lid_closed_mode()
     assert res_denied["ok"] is False and res_denied["needs_sudo"] is True
+    assert "password was cancelled" in res_denied["error"].lower()
+    assert "password was cancelled" in res_denied["message"].lower()
     assert denied_pm.lid_closed_enabled is False
 
     res_off = pm.disable_lid_closed_mode()
     assert res_off["ok"] is True and res_off["enabled"] is False
-    assert calls[-1][-3:] == ["-a", "disablesleep", "0"]
+    assert "osascript" in calls[-1][0]
+    assert calls[-1][1:] == ["-e", 'do shell script "pmset -a disablesleep 0" with administrator privileges']
 
     # Dashboard API + HTML check
     mem = Memory(db_path=tmp_path / "power_api.db")
@@ -69,6 +73,13 @@ def test_stage12_power_manager_toggles_and_dashboard_api(tmp_path, monkeypatch):
     assert "Always-On (Lid Closed)" in client.get("/").text
     assert client.post("/api/power/toggle", json={"enabled": True}).json()["enabled"] is True
     assert client.post("/api/power/toggle", json={"enabled": False}).json()["enabled"] is False
+
+    # API error propagation when osascript fails/cancels
+    agent.power_manager = denied_pm
+    err_resp = client.post("/api/power/toggle", json={"enabled": True}).json()
+    assert err_resp["ok"] is False
+    assert "password was cancelled" in err_resp["error"].lower()
+    assert "password was cancelled" in err_resp["message"].lower()
 
 
 def test_stage12_streaming_tts_chunking_stt_backend_and_wake_gate(monkeypatch):
