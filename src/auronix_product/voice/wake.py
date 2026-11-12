@@ -328,3 +328,55 @@ class WakeWordDetector:
     def close(self) -> None:
         self.session = None
 
+
+class OpenWakeWordGate:
+    """Energy-gated openWakeWord wrapper to suppress ambient noise before wake scoring."""
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "hey_jarvis",
+        threshold: float = 0.55,
+        energy_dbfs: float = -55.0,
+    ) -> None:
+        self.model_name = model_name
+        self.threshold = float(threshold)
+        self.energy_dbfs = float(energy_dbfs)
+        self._oww = None
+        self.last_detect_ms: float = 0.0
+        try:
+            from openwakeword.model import Model as OWWModel  # type: ignore[import-not-found]
+
+            self._oww = OWWModel(wakeword_models=[model_name])
+        except Exception:
+            self._oww = None
+
+    @staticmethod
+    def compute_dbfs(audio_chunk) -> float:
+        import numpy as np
+
+        arr = np.asarray(audio_chunk, dtype=np.float32).flatten()
+        if arr.size == 0:
+            return -120.0
+        rms = float(np.sqrt(np.mean(arr * arr)))
+        if rms <= 1e-6:
+            return -120.0
+        return 20.0 * math.log10(rms)
+
+    def passes_energy_gate(self, audio_chunk) -> bool:
+        return self.compute_dbfs(audio_chunk) >= self.energy_dbfs
+
+    def process_chunk(self, audio_chunk) -> bool:
+        if not self.passes_energy_gate(audio_chunk):
+            return False
+        if self._oww is None:
+            return False
+        import numpy as np
+
+        t0 = time.perf_counter()
+        pcm16 = (np.clip(np.asarray(audio_chunk, dtype=np.float32), -1.0, 1.0) * 32767.0).astype(np.int16)
+        scores = self._oww.predict(pcm16) or {}
+        self.last_detect_ms = (time.perf_counter() - t0) * 1000.0
+        best = max((float(v) for v in scores.values()), default=0.0)
+        return best >= self.threshold
+

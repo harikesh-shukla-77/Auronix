@@ -85,9 +85,16 @@
           <h2>AUTONOMOUS EVOLUTION <span id="evolution-count" class="count-pill">0</span></h2>
           <button id="refresh-evolution-btn" class="icon-btn" title="Reload evolution logs">↻</button>
         </div>
-        <div class="status-row" style="margin-bottom: 8px;">
+        <div class="status-row" style="margin-bottom: 6px;">
           <span class="status-label">Resource State</span>
           <span id="evolution-resource-state" class="badge badge-ok">Active</span>
+        </div>
+        <div class="status-row" style="margin-bottom: 8px;">
+          <span class="status-label">Self-Improve Provider</span>
+          <span id="evolution-provider-badge" class="badge badge-muted">Local</span>
+        </div>
+        <div id="power-battery-warning" class="memory-empty" style="display: none; margin-bottom: 8px; color: #f59e0b;">
+          Warning: Always-On (Lid Closed) prevents sleep and drains battery when unplugged.
         </div>
         <div id="evolution-list" class="memory-list">
           <div class="memory-empty">No Nightly Auto-Improvement cycles recorded yet.</div>
@@ -103,6 +110,12 @@
           <span id="core-state-text">AURONIX CORE: ONLINE</span>
         </div>
         <div class="top-actions">
+          <button id="toggle-lid-closed-btn" class="hud-btn" title="24/7 persistence when lid is closed (drains battery, requires sudo pmset)">
+            🔋 Always-On (Lid Closed): OFF
+          </button>
+          <button id="toggle-auto-improve-btn" class="hud-btn active" title="Enable or disable idle auto-improvement">
+            🤖 Auto-Improve: ON
+          </button>
           <button id="self-improve-btn" class="hud-btn" title="Trigger background self-improvement loop">
             ⚡ Start Self-Improvement (Background)
           </button>

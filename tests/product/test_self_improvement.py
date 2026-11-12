@@ -185,3 +185,160 @@ def test_self_improvement_api_dashboard_and_agent_voice_trigger(tmp_path, monkey
     assert run_resp.status_code == 200
     assert "started" in run_resp.json()
 
+
+def test_stage11_openrouter_deepseek_gemini_routing_and_fallbacks(tmp_path, monkeypatch):
+    import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+    from auronix_product.brain.client import LLM
+    from auronix_product.brain.providers import (
+        AuronixProviderRouter,
+        DeepSeekProvider,
+        GeminiProvider,
+        OllamaProvider,
+        OpenRouterProvider,
+    )
+
+    # Verify .env.example documents all Stage 11 optional keys + flag
+    env_example = Path("/Users/harikeshshukla/Auronix/.env.example").read_text(encoding="utf-8")
+    assert "DEEPSEEK_API_KEY" in env_example
+    assert "OPENROUTER_API_KEY" in env_example
+    assert "AURONIX_IDLE_AUTO_IMPROVE=true" in env_example
+
+    # Clear optional keys first: everything falls back cleanly to Local Ollama / Dolphin / Qwen
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    ollama_calls: list[str] = []
+
+    def fake_ollama_post(_url, json=None, timeout=None):
+        ollama_calls.append(json["model"])
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"message": {"content": f"ollama:{json['model']}"}}
+        return resp
+
+    fake_http = MagicMock()
+    fake_http.post.side_effect = fake_ollama_post
+    local_only_router = AuronixProviderRouter(
+        http_client=fake_http,
+        ollama_provider=OllamaProvider(http_client=fake_http),
+        enable_coder_32b=False,
+    )
+    assert local_only_router.provider_summary()["headline"] == "Local"
+    assert local_only_router.route_task(task_type="self_research", prompt="doc best practice")["model"] == "qwen2.5:7b"
+    assert local_only_router.route_task(task_type="self_coding", prompt="patch code")["model"] == "dolphin-uncensored:latest"
+    assert local_only_router.route_task(task_type="self_review", prompt="review")["model"] == "qwen2.5:7b"
+
+    # Now configure OpenRouter (free qwen3-coder), DeepSeek, and Gemini -> test primary + fallback hops
+    def _openai_mock(text: str | Exception):
+        c = MagicMock()
+        if isinstance(text, Exception):
+            c.chat.completions.create.side_effect = text
+        else:
+            c.chat.completions.create.return_value = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+            )
+        return c
+
+    openrouter_client = _openai_mock("OpenRouter best practice: Keep functions concise.")
+    deepseek_client = _openai_mock(
+        json.dumps(
+            {
+                "full_code": 'def double(x):\n    """Double x cleanly."""\n    return x * 2\n',
+                "explanation": "Add PEP 257 docstring via DeepSeek",
+            }
+        )
+    )
+    gemini_client = MagicMock()
+    gemini_client.models.generate_content.return_value = SimpleNamespace(
+        text='{"approved": true, "reason": "Gemini verified clean docstring"}'
+    )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-ds-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gem-key")
+
+    target = _build_temp_repo(tmp_path)
+    mem = Memory(db_path=tmp_path / "stage11.db")
+
+    router = AuronixProviderRouter(
+        http_client=fake_http,
+        ollama_provider=OllamaProvider(http_client=fake_http),
+        openrouter_provider=OpenRouterProvider(client=openrouter_client),
+        deepseek_provider=DeepSeekProvider(client=deepseek_client),
+        gemini_provider=GeminiProvider(client=gemini_client),
+        enable_coder_32b=False,
+    )
+    summary = router.provider_summary()
+    assert summary["self_research"] == "OpenRouter"
+    assert summary["self_coding"] == "DeepSeek"
+    assert summary["self_review"] == "Gemini"
+
+    # Run full SelfImprovementLoop cycle through provider_router + real pytest
+    real_llm = LLM()
+    real_llm.gateway = router
+    coder = SelfCoder(
+        repo_root=tmp_path,
+        llm=real_llm,
+        log_path=tmp_path / "updates.log",
+        backup_dir=tmp_path / "backups",
+        test_cmd=[sys.executable, "-m", "pytest", "tests/", "-v"],
+        memory=mem,
+    )
+    loop = SelfImprovementLoop(
+        self_coder=coder,
+        provider_router=router,
+        memory=mem,
+        repo_root=tmp_path,
+        log_path=tmp_path / "imp11.jsonl",
+        now_fn=lambda: datetime.datetime(2026, 11, 12, 3, 0, 0),
+    )
+
+    rec = loop.run_once(force=True, trigger="nightly_3am")
+    assert rec["status"] == "applied"
+    assert rec["providers"]["research"] == "openrouter:qwen/qwen3-coder:free"
+    assert rec["providers"]["coding"] == "deepseek:deepseek-chat"
+    assert rec["providers"]["review"].startswith("gemini:")
+    assert '"""Double x cleanly."""' in target.read_text(encoding="utf-8")
+
+    # Test OpenRouter failure -> automatic fallback to DeepSeek for self_research
+    failing_or = _openai_mock(RuntimeError("OpenRouter rate limited"))
+    ds_research = _openai_mock("DeepSeek research answer")
+    fb_router = AuronixProviderRouter(
+        http_client=fake_http,
+        ollama_provider=OllamaProvider(http_client=fake_http),
+        openrouter_provider=OpenRouterProvider(client=failing_or),
+        deepseek_provider=DeepSeekProvider(client=ds_research),
+        gemini_provider=GeminiProvider(client=gemini_client),
+        enable_coder_32b=False,
+    )
+    fb_res = fb_router.route_task(task_type="self_research", prompt="python loop best practice")
+    assert fb_res["provider"] == "deepseek"
+    assert "DeepSeek" in fb_res["content"]
+
+    # AURONIX_IDLE_AUTO_IMPROVE toggle + Dashboard endpoints & HTML UI
+    loop.set_enabled(False)
+    assert loop.should_trigger_scheduled(datetime.datetime(2026, 11, 13, 3, 0, 0)) == (False, "disabled")
+    loop.set_enabled(True)
+
+    monkeypatch.setattr(agent_mod, "Memory", lambda: mem)
+    agent = agent_mod.Agent()
+    agent.self_improvement = loop
+    monkeypatch.setattr(server_mod, "_probe_ollama", lambda _u: (True, ["qwen2.5:7b"]))
+    client = TestClient(server_mod.create_app(agent=agent))
+
+    status_json = client.get("/api/status").json()
+    assert status_json["self_improvement_provider"]["self_research"] == "OpenRouter"
+    assert status_json["idle_auto_improve"] is True
+
+    tog = client.post("/api/self_improvement/toggle", json={"enabled": False}).json()
+    assert tog["enabled"] is False
+    assert loop.enabled is False
+
+    html = client.get("/").text
+    assert "Self-Improve Provider" in html
+    assert "Auto-Improve:" in html
+
+

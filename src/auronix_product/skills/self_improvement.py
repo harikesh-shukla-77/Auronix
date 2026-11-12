@@ -5,17 +5,20 @@ from __future__ import annotations
 import ast
 import datetime
 import json
+import os
 from pathlib import Path
 import re
 import threading
 import time
 from typing import Any, Callable
+from unittest.mock import MagicMock
 
 import psutil
 
 from auronix.policy.engine import PolicyOutcome
 
 from .. import config
+from ..brain.providers import AuronixProviderRouter
 from ..core.logger import get_logger
 from .research import ResearchSkill
 from .self_coder import HIGH_RISK_FILES, SelfCoder
@@ -114,6 +117,8 @@ class SelfImprovementLoop:
         *,
         self_coder: SelfCoder | None = None,
         research_skill: ResearchSkill | None = None,
+        provider_router: AuronixProviderRouter | None = None,
+        dream_engine=None,
         memory=None,
         resource_manager=None,
         repo_root: str | Path | None = None,
@@ -121,6 +126,7 @@ class SelfImprovementLoop:
         nightly_hour: int = DEFAULT_NIGHTLY_HOUR,
         idle_trigger_seconds: float = DEFAULT_IDLE_TRIGGER_SECONDS,
         idle_cpu_threshold: float = DEFAULT_IDLE_CPU_THRESHOLD,
+        enabled: bool | None = None,
         now_fn: Callable[[], datetime.datetime] | None = None,
         log_path: str | Path = DEFAULT_IMPROVEMENT_LOG_PATH,
         logger=None,
@@ -132,6 +138,7 @@ class SelfImprovementLoop:
         )
         self.memory = memory
         self.resource_manager = resource_manager
+        self.dream_engine = dream_engine
         self.logger = logger or get_logger("auronix.self_improvement")
         self.self_coder = self_coder or SelfCoder(repo_root=self.repo_root, memory=self.memory)
         self.research_skill = research_skill or ResearchSkill(
@@ -139,6 +146,23 @@ class SelfImprovementLoop:
             timeout=30,
             memory=self.memory,
         )
+        llm_gw = getattr(self.self_coder.llm, "gateway", None)
+        self._explicit_provider_router = provider_router is not None
+        self.provider_router: AuronixProviderRouter = (
+            provider_router
+            if provider_router is not None
+            else (llm_gw if isinstance(llm_gw, AuronixProviderRouter) else AuronixProviderRouter())
+        )
+        if enabled is None:
+            env_flag = os.environ.get("AURONIX_IDLE_AUTO_IMPROVE")
+            self.enabled = (
+                config.AURONIX_IDLE_AUTO_IMPROVE
+                if env_flag is None
+                else env_flag.strip().lower() in ("1", "true", "yes", "on")
+            )
+        else:
+            self.enabled = bool(enabled)
+
         self.interval_seconds = float(interval_seconds)
         self.nightly_hour = int(nightly_hour)
         self.idle_trigger_seconds = float(idle_trigger_seconds)
@@ -153,6 +177,7 @@ class SelfImprovementLoop:
         self._seen_signatures: set[str] = set()
         self._last_nightly_date: str | None = None
         self._last_scheduled_ts: float = time.monotonic()
+        self.last_providers: dict[str, str] = {}
         self._records: list[dict[str, Any]] = self._load_persisted_logs()
 
     def _load_persisted_logs(self) -> list[dict[str, Any]]:
@@ -201,8 +226,27 @@ class SelfImprovementLoop:
             self.logger.warn(f"Could not save self-improvement memory: {exc}")
         return msg
 
+    def set_enabled(self, enabled: bool) -> bool:
+        """Toggle autonomous idle/nightly self-improvement behavior at runtime."""
+        self.enabled = bool(enabled)
+        self.logger.info(f"Autonomous idle self-improvement set to enabled={self.enabled}")
+        return self.enabled
+
+    def _should_use_provider_router(self) -> bool:
+        if self._explicit_provider_router:
+            return True
+        return not isinstance(self.self_coder.llm, MagicMock)
+
+    def provider_summary(self) -> dict[str, Any]:
+        """Return configured and last-used self-improvement provider info."""
+        summary = self.provider_router.provider_summary()
+        summary["last_used"] = dict(self.last_providers)
+        return summary
+
     def should_trigger_scheduled(self, now: datetime.datetime | None = None) -> tuple[bool, str]:
         """Check whether 3:00 AM nightly schedule, 1h idle window, or periodic interval is due."""
+        if not self.enabled:
+            return False, "disabled"
         ref_now = now or self._now_fn()
         today_str = ref_now.date().isoformat()
         if ref_now.hour == self.nightly_hour and self._last_nightly_date != today_str:
@@ -222,11 +266,16 @@ class SelfImprovementLoop:
         return False, ""
 
     def check_schedule_and_run(self, now: datetime.datetime | None = None) -> dict[str, Any] | None:
-        """Evaluate nightly/idle schedule and run one improvement cycle if due."""
+        """Evaluate nightly/idle schedule, run Dream consolidation if attached, and run one improvement cycle."""
         due, reason = self.should_trigger_scheduled(now=now)
         if not due:
             return None
         self._last_scheduled_ts = time.monotonic()
+        if self.dream_engine is not None and reason in ("nightly_3am", "idle_1h"):
+            try:
+                self.dream_engine.run_dream_cycle()
+            except Exception as exc:
+                self.logger.warn(f"Dream consolidation cycle failed ({exc}); continuing improvement")
         return self.run_once(force=(reason == "nightly_3am"), trigger=reason)
 
     @staticmethod
@@ -298,33 +347,68 @@ class SelfImprovementLoop:
                     return rec
 
                 rel_file = candidate["file"]
+                use_router = self._should_use_provider_router()
+                providers_used: dict[str, str] = {}
                 self.logger.info(
                     f"SelfImprovementLoop ({trigger}) selected candidate ({candidate['kind']}) in {rel_file}"
                 )
 
-                # 4. Consult ResearchSkill for best practices
+                # 4. Consult self_research route (OpenRouter free -> DeepSeek -> Ollama qwen2.5:7b)
                 research_summary = ""
-                try:
-                    res = self.research_skill.research(candidate["research_query"], max_sites=2)
-                    research_summary = str(res.get("summary", "")).strip()
-                except Exception as exc:
-                    self.logger.warn(f"ResearchSkill step skipped ({exc}); continuing with issue prompt")
+                if use_router:
+                    try:
+                        r_msgs = [
+                            {
+                                "role": "system",
+                                "content": "Give 2 concise Python engineering best practices for this code improvement task.",
+                            },
+                            {"role": "user", "content": candidate["research_query"]},
+                        ]
+                        r_res = self.provider_router.route_task(task_type="self_research", messages=r_msgs)
+                        research_summary = str(r_res.get("content", "")).strip()
+                        providers_used["research"] = f"{r_res.get('provider')}:{r_res.get('model')}"
+                    except Exception as exc:
+                        self.logger.warn(f"self_research router fallback to ResearchSkill: {exc}")
+                if not research_summary:
+                    try:
+                        res = self.research_skill.research(candidate["research_query"], max_sites=2)
+                        research_summary = str(res.get("summary", "")).strip()
+                        providers_used.setdefault("research", "research_skill")
+                    except Exception as exc:
+                        self.logger.warn(f"ResearchSkill step skipped ({exc}); continuing with issue prompt")
 
                 issue_prompt = (
                     f"{candidate['description']}."
                     + (f" Best-practice context: {research_summary[:350]}" if research_summary else "")
                 )
 
-                # 5. Propose patch via SelfCoder
-                patch = self.self_coder.propose_fix(issue_prompt)
+                # 5. Propose patch via SelfCoder (using self_coding: 32B -> DeepSeek -> Dolphin)
+                if use_router:
+                    patch = self.self_coder.propose_fix(
+                        issue_prompt,
+                        target_file=rel_file,
+                        patch_generator=lambda msgs, _m: self.provider_router.route_task(
+                            task_type="self_coding",
+                            messages=msgs,
+                        ),
+                    )
+                    if patch.get("coder_provider"):
+                        providers_used["coding"] = f"{patch.get('coder_provider')}:{patch.get('coder_model')}"
+                else:
+                    patch = self.self_coder.propose_fix(issue_prompt)
+                    providers_used["coding"] = f"local:{self.self_coder.model_name}"
+
                 if patch.get("blocked") or patch.get("error"):
                     reason = str(patch.get("error") or "Proposal blocked or invalid.")
+                    self.last_providers = providers_used
                     rec = {
                         "timestamp": started_at,
                         "status": "aborted",
                         "stage": "coder",
+                        "trigger": trigger,
                         "file": patch.get("file") or rel_file,
                         "risk_level": patch.get("risk_level", "HIGH"),
+                        "providers": providers_used,
                         "reason": reason,
                         "applied": False,
                     }
@@ -343,12 +427,15 @@ class SelfImprovementLoop:
                 )
                 if risk_level not in ("LOW", "MEDIUM") or policy_decision.outcome != PolicyOutcome.ALLOW:
                     reason = f"Aborted {risk_level}-risk improvement ({policy_decision.outcome.value}): {policy_decision.reason}"
+                    self.last_providers = providers_used
                     rec = {
                         "timestamp": started_at,
                         "status": "aborted_high_risk",
                         "stage": "policy",
+                        "trigger": trigger,
                         "file": target_file,
                         "risk_level": risk_level,
+                        "providers": providers_used,
                         "reason": reason,
                         "applied": False,
                     }
@@ -356,16 +443,32 @@ class SelfImprovementLoop:
                     self.logger.warn(reason)
                     return rec
 
-                # 6. Review patch via CodeReviewer (Gemini if GEMINI_API_KEY set)
-                review = self.self_coder.review_proposed_patch(patch)
+                # 6. Review patch via self_review (Gemini -> Ollama qwen2.5:7b)
+                if use_router:
+                    review = self.self_coder.review_proposed_patch(
+                        patch,
+                        reviewer_fn=lambda msgs: self.provider_router.route_task(
+                            task_type="self_review",
+                            messages=msgs,
+                        ),
+                    )
+                    if review.get("provider"):
+                        providers_used["review"] = f"{review.get('provider')}:{review.get('model')}"
+                else:
+                    review = self.self_coder.review_proposed_patch(patch)
+                    providers_used["review"] = "gemini_or_qwen"
+
+                self.last_providers = providers_used
                 if not review.get("approved", False):
                     reason = str(review.get("reason") or "CodeReviewer rejected patch.")
                     rec = {
                         "timestamp": started_at,
                         "status": "rejected",
                         "stage": "reviewer",
+                        "trigger": trigger,
                         "file": target_file,
                         "risk_level": risk_level,
+                        "providers": providers_used,
                         "reason": reason,
                         "applied": False,
                     }
@@ -389,6 +492,7 @@ class SelfImprovementLoop:
                         "file": target_file,
                         "kind": candidate["kind"],
                         "risk_level": risk_level,
+                        "providers": providers_used,
                         "reason": reason,
                         "memory_message": mem_msg,
                         "verification_id": verification_id,
@@ -407,6 +511,7 @@ class SelfImprovementLoop:
                     "file": target_file,
                     "kind": candidate["kind"],
                     "risk_level": risk_level,
+                    "providers": providers_used,
                     "reason": f"Verification failed for {target_file}; rolled back from /tmp backup.",
                     "verification_id": verification_id,
                     "backup_path": str(getattr(self.self_coder, "last_backup_path", "") or ""),
@@ -458,9 +563,11 @@ class SelfImprovementLoop:
         safe_limit = max(1, min(200, int(limit)))
         items = list(reversed(self._records[-safe_limit:]))
         return {
+            "enabled": self.enabled,
             "running": self._active_run,
             "daemon_active": bool(self._thread is not None and self._thread.is_alive()),
             "interval_seconds": self.interval_seconds,
+            "provider_summary": self.provider_summary(),
             "count": len(items),
             "items": items,
             "last_run": items[0] if items else None,

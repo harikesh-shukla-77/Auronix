@@ -20,6 +20,7 @@ from ..brain.prompts import SYSTEM_PROMPT, EMOJI_RE_PATTERN
 from ..core.context_tracker import ConversationContext
 from ..core.logger import get_logger
 from ..core.memory import Memory
+from ..core.power_manager import PowerManager
 from ..core.resource_manager import ResourceManager
 from ..voice import sfx
 from ..voice.audio_guard import is_barge_in_command, should_discard_transcript
@@ -33,7 +34,15 @@ from ..actions.handlers import open_app, search_web
 from ..actions.router import copy_to_clipboard, execute_open, execute_search, quick_route, RoutedCommand
 from ..actions.scheduler import ReminderScheduler
 from ..actions.schemas import TOOLS
-from ..skills import KnowledgeSkill, ResearchSkill, SelfCoder, SelfImprovementLoop, VisionSkill
+from ..skills import (
+    ComputerUseSkill,
+    DreamEngine,
+    KnowledgeSkill,
+    ResearchSkill,
+    SelfCoder,
+    SelfImprovementLoop,
+    VisionSkill,
+)
 
 _EMOJI_RE = _re.compile(EMOJI_RE_PATTERN, flags=_re.UNICODE)
 
@@ -289,9 +298,23 @@ class Agent:
             llm=self.llm,
             logger=self.logger,
         )
+        self.power_manager = PowerManager(logger=self.logger)
+        self.computer_use = ComputerUseSkill(
+            llm=self.llm,
+            vision_skill=self.vision_skill,
+            logger=self.logger,
+        )
+        self.dream_engine = DreamEngine(
+            memory=self.memory,
+            self_coder=self.self_coder,
+            provider_router=getattr(self.llm, "gateway", None),
+            journal_path=self.memory.db_path.parent / "dream_journal.jsonl",
+            logger=self.logger,
+        )
         self.self_improvement = SelfImprovementLoop(
             self_coder=self.self_coder,
             research_skill=self.research_skill,
+            dream_engine=self.dream_engine,
             memory=self.memory,
             resource_manager=self.resource_manager,
             log_path=self.memory.db_path.parent / "self_improvement_logs.jsonl",
@@ -712,9 +735,20 @@ class Agent:
             if getattr(routed, "pending_intent", None):
                 self.pending_intent = PendingIntent(routed.pending_intent)
             if routed.needs_confirm:
-                self._pending_confirm = routed.confirm_action
-                self._pending_desc = routed.confirm_desc
-                notify_alert("Auronix", f"Confirm: {routed.confirm_desc}")
+                desc = str(routed.confirm_desc or "")
+                if desc.startswith("click:"):
+                    target_desc = desc.split(":", 1)[1]
+                    self._pending_confirm = lambda t=target_desc: self.computer_use.click(t, confirmed=True)
+                elif desc.startswith("type:"):
+                    txt = desc.split(":", 1)[1]
+                    self._pending_confirm = lambda t=txt: self.computer_use.type_into_active(t, confirmed=True)
+                elif desc.startswith("drag:") and "->" in desc:
+                    src_d, dst_d = desc.split(":", 1)[1].split("->", 1)
+                    self._pending_confirm = lambda s=src_d, d=dst_d: self.computer_use.drag_drop(s, d, confirmed=True)
+                else:
+                    self._pending_confirm = routed.confirm_action
+                self._pending_desc = desc
+                notify_alert("Auronix", f"Confirm: {desc}")
             else:
                 sfx.play_success()
                 notify_result("Auronix", routed.response[:160])
@@ -1133,6 +1167,7 @@ class Agent:
             self.proactive_monitor.stop()
             self.resource_manager.stop()
             self.self_improvement.stop()
+            self.power_manager.stop()
             if hasattr(self, "wake_detector") and self.wake_detector:
                 self.wake_detector.close()
             if getattr(self, "menubar", None) is not None:

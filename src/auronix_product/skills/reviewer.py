@@ -65,7 +65,14 @@ class CodeReviewer:
                 pass
         return self.llm.chat(messages, model=self.model_name)
 
-    def review_patch(self, original_code: str, patched_code: str, issue_description: str) -> dict:
+    def review_patch(
+        self,
+        original_code: str,
+        patched_code: str,
+        issue_description: str,
+        *,
+        ask_fn=None,
+    ) -> dict:
         """Review `patched_code` vs `original_code` and return {'approved': bool, 'reason': str}."""
         if not patched_code or patched_code == original_code:
             return {"approved": False, "reason": "Patch introduces no changes."}
@@ -96,7 +103,7 @@ class CodeReviewer:
         ]
 
         try:
-            res = self._ask_reviewer(messages)
+            res = ask_fn(messages) if ask_fn is not None else self._ask_reviewer(messages)
         except Exception as exc:
             return {"approved": False, "reason": f"Reviewer unavailable: {exc}"}
 
@@ -111,5 +118,11 @@ class CodeReviewer:
         reason = str(parsed.get("reason") or "").strip()
         if not reason:
             reason = "Patch passed senior review." if approved_val else "Patch rejected by code reviewer."
-        return {"approved": approved_val, "reason": reason}
+        out: dict = {"approved": approved_val, "reason": reason}
+        if isinstance(res, dict):
+            if res.get("provider"):
+                out["provider"] = res["provider"]
+            if res.get("model"):
+                out["model"] = res["model"]
+        return out
 

@@ -131,6 +131,10 @@ def create_app(agent: Agent | None = None) -> FastAPI:
             "health": "ok" if db_connected else "degraded",
             "resource_state": res_status["state"],
             "resource_manager": res_status,
+            "power_state": ag.power_manager.status(),
+            "acceleration_backend": ag.stt.get_acceleration_backend(),
+            "idle_auto_improve": ag.self_improvement.enabled,
+            "self_improvement_provider": ag.self_improvement.provider_summary(),
             "models": {
                 "gemini": {
                     "active": gemini_active,
@@ -208,6 +212,28 @@ def create_app(agent: Agent | None = None) -> FastAPI:
                 else "A self-improvement cycle is already running."
             ),
         }
+
+    @app.post("/api/self_improvement/toggle")
+    def api_self_improvement_toggle(payload: VoiceToggleRequest) -> dict[str, Any]:
+        ag = get_agent()
+        new_state = ag.self_improvement.set_enabled(payload.enabled)
+        return {
+            "enabled": new_state,
+            "provider_summary": ag.self_improvement.provider_summary(),
+            "message": f"Autonomous self-improvement {'enabled' if new_state else 'disabled'}.",
+        }
+
+    @app.post("/api/power/toggle")
+    def api_power_toggle(payload: VoiceToggleRequest) -> dict[str, Any]:
+        ag = get_agent()
+        if payload.enabled:
+            return ag.power_manager.enable_lid_closed_mode()
+        return ag.power_manager.disable_lid_closed_mode()
+
+    @app.post("/api/dream/run")
+    def api_dream_run() -> dict[str, Any]:
+        ag = get_agent()
+        return ag.dream_engine.run_dream_cycle()
 
     @app.post("/api/voice/toggle")
     def api_voice_toggle(payload: VoiceToggleRequest) -> dict[str, Any]:

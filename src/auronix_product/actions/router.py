@@ -25,13 +25,15 @@ from .patterns import (
     _OPEN_URL_PATTERNS, _SEARCH_PATTERNS, _NEW_TAB_PATTERNS, _VISION_PATTERNS,
     _CALENDAR_PATTERNS, _RESEARCH_PATTERNS, _SELF_FIX_PATTERNS,
     _KNOWLEDGE_INDEX_PATTERNS, _KNOWLEDGE_QUERY_PATTERNS, _SELF_IMPROVE_PATTERNS,
+    _COMPUTER_CLICK_PATTERNS, _COMPUTER_TYPE_PATTERNS, _COMPUTER_DRAG_PATTERNS,
 )
 from .handlers import (
     get_current_time, get_weather, system_status,
     open_app, close_app, bring_to_front, close_all_windows, lock_screen, minimize_all,
     list_files, move_file, rename_file, trash_file, empty_trash,
     undo_action, list_undoable, add_reminder, list_reminders, cancel_reminders,
-    open_url, search_web, open_new_tab, _normalize_numbers, DEFAULT_CITY,
+    open_url, search_web, open_new_tab, click_on_screen, type_text, drag_and_drop,
+    _normalize_numbers, DEFAULT_CITY,
 )
 
 
@@ -359,6 +361,43 @@ def quick_route(text: str, memory) -> RoutedCommand | None:
     for pat in _VISION_PATTERNS:
         if re.search(pat, lower):
             return RoutedCommand("__VISION_READ__")
+
+    # COMPUTER USE (mandatory confirmation security gate)
+    for pat in _COMPUTER_CLICK_PATTERNS:
+        m = re.match(pat, raw_trimmed, re.IGNORECASE)
+        if m:
+            target_desc = m.group(1).strip()
+            if target_desc:
+                return RoutedCommand(
+                    f"Are you sure you want me to click '{target_desc}'? Say 'Yes' to confirm.",
+                    needs_confirm=True,
+                    confirm_action=lambda t=target_desc: click_on_screen(t),
+                    confirm_desc=f"click:{target_desc}",
+                )
+
+    for pat in _COMPUTER_TYPE_PATTERNS:
+        m = re.match(pat, raw_trimmed, re.IGNORECASE)
+        if m:
+            text_to_type = m.group(1).strip()
+            if text_to_type:
+                return RoutedCommand(
+                    f"Are you sure you want me to type '{text_to_type}' into the active window? Say 'Yes' to confirm.",
+                    needs_confirm=True,
+                    confirm_action=lambda txt=text_to_type: type_text(txt),
+                    confirm_desc=f"type:{text_to_type}",
+                )
+
+    for pat in _COMPUTER_DRAG_PATTERNS:
+        m = re.match(pat, raw_trimmed, re.IGNORECASE)
+        if m:
+            src_desc, dst_desc = m.group(1).strip(), m.group(2).strip()
+            if src_desc and dst_desc:
+                return RoutedCommand(
+                    f"Are you sure you want me to drag '{src_desc}' to '{dst_desc}'? Say 'Yes' to confirm.",
+                    needs_confirm=True,
+                    confirm_action=lambda s=src_desc, d=dst_desc: drag_and_drop(s, d),
+                    confirm_desc=f"drag:{src_desc}->{dst_desc}",
+                )
 
     # BROWSER AUTOMATION
     for pat in _OPEN_URL_PATTERNS:

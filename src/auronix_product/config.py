@@ -1,15 +1,25 @@
 """Auronix configuration."""
 
 import json
+import os
 from pathlib import Path
 
 OLLAMA_URL = "http://localhost:11434"
 # Fast chit-chat model by default; switch to smart (qwen2.5:7b) for tools or "smart mode".
 OLLAMA_MODEL = "qwen2.5:3b"
 OLLAMA_SMART_MODEL = "qwen2.5:7b"
+OLLAMA_CODER_32B_MODEL = "qwen2.5-coder:32b"
 OLLAMA_DOLPHIN_MODEL = "dolphin-uncensored:latest"
 OLLAMA_VISION_MODEL = "minicpm-v:latest"
 GEMINI_MODEL = "gemini-2.5-flash"
+DEEPSEEK_MODEL = "deepseek-chat"
+OPENROUTER_FREE_MODEL = "qwen/qwen3-coder:free"
+AURONIX_IDLE_AUTO_IMPROVE = os.environ.get("AURONIX_IDLE_AUTO_IMPROVE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 SELF_CODER_BACKUP_DIR = "/tmp/auronix_self_coder_backup"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 WHISPER_LANGUAGE = "en"

@@ -642,3 +642,91 @@ def read_screen_content(llm) -> str:
         "commands and output. Be direct, no fluff.",
     )
 
+
+# ============ Stage 12 Computer Use (pyautogui + minicpm-v) ============
+
+def _vision_locate(description: str, llm=None, vision_skill=None) -> tuple[bool, int, int, str]:
+    """Capture screen and ask minicpm-v for target pixel coordinates scaled to desktop points."""
+    from PIL import Image
+    import pyautogui
+    from ..skills.vision import VisionSkill
+
+    vs = vision_skill or VisionSkill(llm=llm)
+    img_path = Path(vs.capture_screen())
+    with Image.open(img_path) as im:
+        img_w, img_h = im.size
+    screen_w, screen_h = pyautogui.size()
+
+    prompt = (
+        f"Find the UI element matching: '{description}'. "
+        f"Image size is {img_w}x{img_h} px. "
+        'Return ONLY JSON: {"found": true, "x": <int>, "y": <int>}.'
+    )
+    raw = vs.analyze_screen(prompt, image_path=img_path)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    parsed: dict = {}
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                parsed = data
+        except Exception:
+            pass
+    if not parsed:
+        xy = re.search(r"x\s*[:=]\s*(\d+(?:\.\d+)?)\D+y\s*[:=]\s*(\d+(?:\.\d+)?)", raw, re.IGNORECASE)
+        if xy:
+            parsed = {"found": True, "x": float(xy.group(1)), "y": float(xy.group(2))}
+
+    if not parsed or not parsed.get("found", True) or "x" not in parsed or "y" not in parsed:
+        return False, 0, 0, raw
+
+    sx = max(0, min(int(screen_w) - 1, int(round((float(parsed["x"]) / max(1, img_w)) * screen_w))))
+    sy = max(0, min(int(screen_h) - 1, int(round((float(parsed["y"]) / max(1, img_h)) * screen_h))))
+    return True, sx, sy, raw
+
+
+def click_on_screen(text_description: str, llm=None, vision_skill=None) -> str:
+    """Locate UI target via Vision (minicpm-v) and click it via pyautogui."""
+    try:
+        import pyautogui
+
+        found, sx, sy, raw = _vision_locate(text_description, llm=llm, vision_skill=vision_skill)
+        if not found:
+            return f"Could not locate '{text_description}' on screen ({raw[:100]})."
+        pyautogui.click(sx, sy)
+        return f"Clicked '{text_description}' at ({sx}, {sy})."
+    except Exception as e:
+        return f"Screen click failed: {e}"
+
+
+def type_text(text: str, interval: float = 0.02) -> str:
+    """Type text into the currently focused macOS window via pyautogui."""
+    try:
+        import pyautogui
+
+        clean = str(text or "")
+        if not clean:
+            return "No text provided to type."
+        pyautogui.write(clean, interval=interval)
+        return f"Typed text ({len(clean)} chars)."
+    except Exception as e:
+        return f"Type text failed: {e}"
+
+
+def drag_and_drop(from_desc: str, to_desc: str, llm=None, vision_skill=None) -> str:
+    """Locate source & target UI elements via Vision and drag-and-drop via pyautogui."""
+    try:
+        import pyautogui
+
+        found_src, x1, y1, _ = _vision_locate(from_desc, llm=llm, vision_skill=vision_skill)
+        if not found_src:
+            return f"Could not locate source '{from_desc}' on screen."
+        found_dst, x2, y2, _ = _vision_locate(to_desc, llm=llm, vision_skill=vision_skill)
+        if not found_dst:
+            return f"Could not locate destination '{to_desc}' on screen."
+        pyautogui.moveTo(x1, y1)
+        pyautogui.dragTo(x2, y2, duration=0.4, button="left")
+        return f"Dragged '{from_desc}' ({x1}, {y1}) to '{to_desc}' ({x2}, {y2})."
+    except Exception as e:
+        return f"Drag and drop failed: {e}"
+

@@ -559,21 +559,28 @@ class SelfCoder:
         return candidates[0]
 
     def _gather_research_context(self, issue_description: str) -> str:
-        """Researcher step: look up related prior lessons in SQLite memory when available."""
-        if self.memory is None or not hasattr(self.memory, "search_memory"):
-            return ""
-        try:
-            hits = self.memory.search_memory(issue_description, limit=3)
-            if not hits:
-                return ""
-            return "\n".join(f"- {h.title}: {h.content[:200]}" for h in hits)
-        except Exception:
-            return ""
+        """Researcher step: look up related prior lessons and DreamEngine heuristics."""
+        notes: list[str] = []
+        for h in getattr(self, "learned_heuristics", [])[-3:]:
+            notes.append(f"- Dream Heuristic: {str(h)[:200]}")
+        if self.memory is not None and hasattr(self.memory, "search_memory"):
+            try:
+                hits = self.memory.search_memory(issue_description, limit=3)
+                notes.extend(f"- {h.title}: {h.content[:200]}" for h in hits)
+            except Exception:
+                pass
+        return "\n".join(notes)
 
-    def propose_fix(self, issue_description: str) -> dict:
-        """Researcher + Coder step: identify target file, generate patch with Dolphin, score risk."""
+    def propose_fix(
+        self,
+        issue_description: str,
+        *,
+        target_file: str | None = None,
+        patch_generator=None,
+    ) -> dict:
+        """Researcher + Coder step: identify target file, generate patch with Dolphin/Router, score risk."""
         research_notes = self._gather_research_context(issue_description)
-        target_rel = self._identify_target_file(issue_description)
+        target_rel = target_file or self._identify_target_file(issue_description)
         allowed, target_abs, info = self.validate_target_path(target_rel)
         if not allowed or target_abs is None:
             return {
@@ -613,13 +620,14 @@ class SelfCoder:
                 f"File content ({rel_posix}):\n```python\n{original_text[:20000]}\n```"
             )
 
-        res = self.llm.chat(
-            [
-                {"role": "system", "content": DOLPHIN_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            model=coder_model,
-        )
+        messages = [
+            {"role": "system", "content": DOLPHIN_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        if patch_generator is not None:
+            res = patch_generator(messages, coder_model)
+        else:
+            res = self.llm.chat(messages, model=coder_model)
         raw_content = res.get("content", "")
         parsed = _parse_json_object(raw_content)
         explanation = str(parsed.get("explanation", "")).strip()
@@ -720,6 +728,8 @@ class SelfCoder:
             "match_mode": match_mode,
             "match_similarity": match_similarity,
             "policy_outcome": policy_decision.outcome.value,
+            "coder_provider": res.get("provider"),
+            "coder_model": res.get("model") or coder_model,
         }
         if full_code is not None:
             patch["full_code"] = full_code
@@ -800,7 +810,7 @@ class SelfCoder:
         except Exception as exc:
             self.logger.error(f"Failed recording coding outcome to memory: {exc}")
 
-    def review_proposed_patch(self, patch: dict) -> dict:
+    def review_proposed_patch(self, patch: dict, *, reviewer_fn=None) -> dict:
         """Run CodeReviewer against original and patched file content before execution."""
         if not patch or patch.get("blocked") or patch.get("error"):
             review = {"approved": False, "reason": patch.get("error") or "Invalid patch."}
@@ -820,11 +830,26 @@ class SelfCoder:
         patched_text, _, _ = _resolve_patch_application(original_text, patch)
         if patched_text is None:
             patched_text = str(patch.get("full_code") or patch.get("new_code") or "")
-        review = self.reviewer.review_patch(
-            original_text,
-            patched_text,
-            str(patch.get("issue", "")),
-        )
+        if reviewer_fn is not None:
+            try:
+                review = self.reviewer.review_patch(
+                    original_text,
+                    patched_text,
+                    str(patch.get("issue", "")),
+                    ask_fn=reviewer_fn,
+                )
+            except TypeError:
+                review = self.reviewer.review_patch(
+                    original_text,
+                    patched_text,
+                    str(patch.get("issue", "")),
+                )
+        else:
+            review = self.reviewer.review_patch(
+                original_text,
+                patched_text,
+                str(patch.get("issue", "")),
+            )
         self.last_review = review
         target_label = str(patch.get("issue") or info)
         if review.get("approved"):

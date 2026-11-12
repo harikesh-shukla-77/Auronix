@@ -33,6 +33,10 @@ const memoryCountEl = document.getElementById("memory-count");
 const evolutionListEl = document.getElementById("evolution-list");
 const evolutionCountEl = document.getElementById("evolution-count");
 const evolutionResourceStateEl = document.getElementById("evolution-resource-state");
+const evolutionProviderBadgeEl = document.getElementById("evolution-provider-badge");
+const powerBatteryWarningEl = document.getElementById("power-battery-warning");
+const toggleLidClosedBtnEl = document.getElementById("toggle-lid-closed-btn");
+const toggleAutoImproveBtnEl = document.getElementById("toggle-auto-improve-btn");
 const selfImproveBtnEl = document.getElementById("self-improve-btn");
 const toggleTtsBtnEl = document.getElementById("toggle-tts-btn");
 const toggleDaemonBtnEl = document.getElementById("toggle-daemon-btn");
@@ -40,6 +44,8 @@ const micInputBtnEl = document.getElementById("mic-input-btn");
 
 let browserTtsEnabled = false;
 let voiceDaemonActive = false;
+let autoImproveEnabled = true;
+let lidClosedEnabled = false;
 let wsConn = null;
 
 function setCoreState(state, label) {
@@ -117,6 +123,27 @@ async function fetchStatus() {
       setBadge(evolutionResourceStateEl, resState, isSleeping ? "warn" : "ok");
     }
 
+    if (evolutionProviderBadgeEl && data.self_improvement_provider) {
+      const headline = data.self_improvement_provider.headline || "Local";
+      setBadge(evolutionProviderBadgeEl, headline, headline === "Local" ? "muted" : "ok");
+      evolutionProviderBadgeEl.title = `Research: ${data.self_improvement_provider.self_research} | Coding: ${data.self_improvement_provider.self_coding} | Review: ${data.self_improvement_provider.self_review}`;
+    }
+
+    if (typeof data.idle_auto_improve === "boolean" && toggleAutoImproveBtnEl) {
+      autoImproveEnabled = Boolean(data.idle_auto_improve);
+      toggleAutoImproveBtnEl.textContent = `🤖 Auto-Improve: ${autoImproveEnabled ? "ON" : "OFF"}`;
+      toggleAutoImproveBtnEl.classList.toggle("active", autoImproveEnabled);
+    }
+
+    if (data.power_state && toggleLidClosedBtnEl) {
+      lidClosedEnabled = Boolean(data.power_state.lid_closed_enabled);
+      toggleLidClosedBtnEl.textContent = `🔋 Always-On (Lid Closed): ${lidClosedEnabled ? "ON" : "OFF"}`;
+      toggleLidClosedBtnEl.classList.toggle("active", lidClosedEnabled);
+      if (powerBatteryWarningEl) {
+        powerBatteryWarningEl.style.display = lidClosedEnabled ? "block" : "none";
+      }
+    }
+
     const sys = data.system || {};
     metricCpuEl.textContent = sys.cpu_percent != null ? `${sys.cpu_percent}%` : "--%";
     metricRamEl.textContent = sys.memory_percent != null ? `${sys.memory_percent}%` : "--%";
@@ -191,6 +218,10 @@ async function fetchEvolution() {
     if (evolutionResourceStateEl && data.resource_state) {
       const sleeping = String(data.resource_state).toLowerCase().includes("sleep");
       setBadge(evolutionResourceStateEl, data.resource_state, sleeping ? "warn" : "ok");
+    }
+    if (evolutionProviderBadgeEl && data.provider_summary) {
+      const headline = data.provider_summary.headline || "Local";
+      setBadge(evolutionProviderBadgeEl, headline, headline === "Local" ? "muted" : "ok");
     }
 
     evolutionListEl.innerHTML = "";
@@ -310,6 +341,56 @@ document.getElementById("refresh-status-btn").addEventListener("click", fetchSta
 document.getElementById("refresh-memory-btn").addEventListener("click", fetchMemory);
 const refreshEvolutionBtn = document.getElementById("refresh-evolution-btn");
 if (refreshEvolutionBtn) refreshEvolutionBtn.addEventListener("click", fetchEvolution);
+
+if (toggleLidClosedBtnEl) {
+  toggleLidClosedBtnEl.addEventListener("click", async () => {
+    const nextEnabled = !lidClosedEnabled;
+    if (
+      nextEnabled &&
+      !window.confirm(
+        "Warning: Always-On (Lid Closed) disables macOS sleep and drains battery when unplugged (requires sudo pmset permission). Enable?"
+      )
+    ) {
+      return;
+    }
+    try {
+      const resp = await fetch(`${API_BASE}/api/power/toggle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+      const data = await resp.json();
+      lidClosedEnabled = Boolean(data.enabled);
+      toggleLidClosedBtnEl.textContent = `🔋 Always-On (Lid Closed): ${lidClosedEnabled ? "ON" : "OFF"}`;
+      toggleLidClosedBtnEl.classList.toggle("active", lidClosedEnabled);
+      if (powerBatteryWarningEl) {
+        powerBatteryWarningEl.style.display = lidClosedEnabled ? "block" : "none";
+      }
+      appendMessage("assistant", data.message || "Power state updated.", data.ok ? "POWER" : "WARN");
+    } catch (err) {
+      appendMessage("assistant", `Power toggle failed: ${err.message}`, "ERROR");
+    }
+  });
+}
+
+if (toggleAutoImproveBtnEl) {
+  toggleAutoImproveBtnEl.addEventListener("click", async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/self_improvement/toggle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !autoImproveEnabled }),
+      });
+      const data = await resp.json();
+      autoImproveEnabled = Boolean(data.enabled);
+      toggleAutoImproveBtnEl.textContent = `🤖 Auto-Improve: ${autoImproveEnabled ? "ON" : "OFF"}`;
+      toggleAutoImproveBtnEl.classList.toggle("active", autoImproveEnabled);
+      appendMessage("assistant", data.message || "Auto-improve setting updated.", "EVOLUTION");
+    } catch (err) {
+      appendMessage("assistant", `Auto-improve toggle failed: ${err.message}`, "ERROR");
+    }
+  });
+}
 
 if (selfImproveBtnEl) {
   selfImproveBtnEl.addEventListener("click", async () => {

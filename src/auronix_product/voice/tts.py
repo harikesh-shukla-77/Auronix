@@ -121,6 +121,8 @@ class TTS:
         self.last_spoken_text = ""
         self.last_tone: dict = analyze_voice_tone("")
         self.last_provider: str = "kokoro"
+        self.last_first_audio_ms: float = 0.0
+        self.streamed_sentences: list[str] = []
 
     def preload(self):
         """Warm Kokoro pipeline so first speak is fast."""
@@ -160,10 +162,13 @@ class TTS:
             return
         self._speak_blocking(text, tone_context=tone_context)
 
-    def speak_stream(self, text_generator, wait: bool = False) -> str:
-        """Speak sentences on a worker thread as chunks arrive from a text generator."""
+    def speak_stream(self, text_generator, wait: bool = False, early_clause_flush: bool = True) -> str:
+        """Ultra-low-latency Streaming LLM -> TTS: flushes first clause/sentence immediately to worker."""
         self.stop()
         self._stop_requested = False
+        self.streamed_sentences = []
+        t_stream0 = time.perf_counter()
+        first_chunk_emitted = False
         sentence_q: queue.Queue[str | None] = queue.Queue()
 
         def _worker():
@@ -179,6 +184,18 @@ class TTS:
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
 
+        def _enqueue(segment: str) -> None:
+            nonlocal first_chunk_emitted
+            cleaned = segment.strip()
+            if not cleaned:
+                return
+            if not first_chunk_emitted:
+                first_chunk_emitted = True
+                self.last_first_audio_ms = round((time.perf_counter() - t_stream0) * 1000.0, 1)
+                print(f"[timing] tts_stream_first_sentence: {self.last_first_audio_ms:.0f}ms")
+            self.streamed_sentences.append(cleaned)
+            sentence_q.put(cleaned)
+
         full_parts: list[str] = []
         buffer = ""
         try:
@@ -189,17 +206,21 @@ class TTS:
                     continue
                 full_parts.append(chunk)
                 buffer += chunk
-                parts = re.split(r"(?<=[.!?])\s+", buffer)
+                # Flush on sentence boundaries immediately; flush first comma clause >= 28 chars for <500ms TTFA
+                split_re = (
+                    r"(?<=[.!?])\s+"
+                    if (first_chunk_emitted or not early_clause_flush or len(buffer) < 28)
+                    else r"(?<=[.!?,;:])\s+"
+                )
+                parts = re.split(split_re, buffer)
                 if len(parts) > 1:
                     for sentence in parts[:-1]:
-                        cleaned = sentence.strip()
-                        if cleaned:
-                            sentence_q.put(cleaned)
+                        _enqueue(sentence)
                     buffer = parts[-1]
         finally:
             tail = buffer.strip()
             if tail and not self._stop_requested:
-                sentence_q.put(tail)
+                _enqueue(tail)
             sentence_q.put(None)
 
         full_text = "".join(full_parts).strip()

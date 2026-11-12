@@ -85,8 +85,55 @@ def _apply_corrections(text: str) -> str:
 class STT:
     def __init__(self):
         self.model_name = "mlx-community/whisper-large-v3-mlx"
+        self.coreml_fallback_model = "base.en"
         self._ready = False
         self._vad_model = None
+        self.last_backend = "mlx_whisper"
+
+    @staticmethod
+    def get_acceleration_backend() -> str:
+        """Report preferred Apple Silicon hardware backend: mlx_whisper -> coreml_ane -> faster_whisper."""
+        try:
+            import mlx_whisper  # noqa: F401
+            return "mlx_whisper"
+        except Exception:
+            pass
+        try:
+            import coremltools  # noqa: F401
+            return "coreml_ane"
+        except Exception:
+            pass
+        try:
+            import faster_whisper  # noqa: F401
+            return "faster_whisper"
+        except Exception:
+            return "cpu"
+
+    def _transcribe_coreml_fallback(self, wav_path: str) -> str:
+        """Fallback to CoreML/ANE or faster-whisper for small models when mlx-whisper fails."""
+        try:
+            import faster_whisper
+
+            model = faster_whisper.WhisperModel(self.coreml_fallback_model, device="cpu", compute_type="int8")
+            segments, _ = model.transcribe(wav_path, language="en")
+            self.last_backend = "faster_whisper_ane_fallback"
+            return " ".join(seg.text.strip() for seg in segments).strip()
+        except Exception:
+            return ""
+
+    def stream_transcribe(self, audio_chunks):
+        """Yield progressive transcriptions across streaming speech chunks for low latency."""
+        accumulated: list[np.ndarray] = []
+        for chunk in audio_chunks:
+            arr = np.asarray(chunk, dtype=np.float32).flatten()
+            if arr.size == 0:
+                continue
+            accumulated.append(arr)
+            joined = np.concatenate(accumulated)
+            if len(joined) >= 4800:
+                partial = self.transcribe(joined)
+                if partial:
+                    yield partial
 
     def _get_vad_model(self):
         if self._vad_model is None:
@@ -353,8 +400,11 @@ class STT:
                 verbose=False,
             )
         except Exception as e:
-            print(f"[stt] transcribe error: {e}")
-            return ""
+            print(f"[stt] mlx_whisper error ({e}); trying CoreML/ANE fallback")
+            fb_text = self._transcribe_coreml_fallback(path)
+            if not fb_text:
+                return ""
+            result = {"text": fb_text, "language": "en"}
 
         text = result.get("text", "").strip()
         detected = result.get("language", "?")

@@ -202,3 +202,15 @@ _SELF_IMPROVE_PATTERNS = [
     r"\bkhud\s+ko\s+improve\s+karo\b",
 ]
 
+_COMPUTER_CLICK_PATTERNS = [
+    r"^(?:please\s+)?(?:click|tap|press)\s+(?:on\s+)?(?:the\s+)?(.+)$",
+]
+
+_COMPUTER_TYPE_PATTERNS = [
+    r"^(?:please\s+)?type\s+(?:the\s+text\s+)?[\"']?(.+?)[\"']?(?:\s+(?:into|in)\s+(?:the\s+)?(?:active\s+)?window)?$",
+]
+
+_COMPUTER_DRAG_PATTERNS = [
+    r"^(?:please\s+)?drag(?:\s+and\s+drop)?\s+(.+?)\s+(?:to|onto|into)\s+(.+)$",
+]
+
